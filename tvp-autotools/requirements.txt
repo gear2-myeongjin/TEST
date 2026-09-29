@@ -1,0 +1,3 @@
+pytvpaint==1.1.2
+Pillow>=10
+pyinstaller>=6
