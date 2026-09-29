@@ -14,7 +14,6 @@ from typing import Iterator
 os.environ.setdefault("PYTVPAINT_WS_STARTUP_CONNECT", "0")
 os.environ.setdefault("PYTVPAINT_LOG_LEVEL", "WARNING")
 
-from fileseq import FileSequence, FrameSet  # noqa: E402
 from pytvpaint import george  # noqa: E402
 from pytvpaint.george.client import rpc_client  # noqa: E402
 from pytvpaint.layer import Layer, LayerInstance  # noqa: E402
@@ -27,6 +26,7 @@ from tvp_autotools.ops import CropSpec, LayerRef, ToolError  # noqa: E402
 class TVPaintBackend:
     def __init__(self) -> None:
         self._layer_cache: dict[int, Layer] = {}
+        self._strategy: str | None = None  # 이 TVPaint 에서 동작이 확인된 저장 방식
 
     # ---------- 연결 ----------
     def connect(self) -> None:
@@ -85,95 +85,159 @@ class TVPaintBackend:
         return result
 
     # ---------- 렌더 ----------
-    def render_instances(self, ref: LayerRef, starts: list[int], out_dir: Path) -> dict[int, Path]:
-        """레이어만 단독으로, 투명 배경·비프리멀티플라이 PNG 로 렌더한다.
+    # TVPaint 환경에 따라 특정 저장 명령이 -1 을 돌려주는 경우가 있어, 여러 방식을 첫 프레임에 시험해 보고
+    # 제대로 된 PNG(캔버스 크기)를 만드는 첫 번째 방식을 이후 프레임에 사용한다.
+    STRATEGIES = ("ProjectSaveSequence", "SaveSequence", "SaveImage", "SaveDisplay")
 
-        불투명도/블렌딩 모드는 렌더 중에만 100%/Color 로 바꿨다가 반드시 원래대로 되돌린다.
-        (불투명도가 픽셀에 구워지면 크롭 후 불투명도가 이중 적용되기 때문)
-        """
+    def render_instances(self, ref: LayerRef, starts: list[int], out_dir: Path) -> dict[int, Path]:
         layer = self._layer(ref)
         clip = layer.clip
-        visibility = [(lyr, lyr.is_visible) for lyr in clip.layers]
-        opacity = layer.opacity
-        blending = layer.blending_mode
-        # PyTVPaint 렌더 도중 오류가 나면 배경/저장 설정이 복구되지 않으므로 직접 저장해 두었다가 되돌린다
-        background = george.tv_background_get()
-        alpha_save = george.tv_alpha_save_mode_get()
-        save_mode = george.tv_save_mode_get()
-        frame_set = FrameSet(sorted(starts))
-        try:
-            layer.opacity = 100
-            layer.blending_mode = george.BlendingMode.COLOR
-            pattern = str(out_dir / "inst.#.png")
-            try:
-                seq = clip.render(
-                    pattern,
-                    frame_set=frame_set,
-                    layer_selection=[layer],
-                    alpha_mode=george.AlphaSaveMode.NO_PREMULTIPLY,
-                    background_mode=george.BackgroundMode.NONE,
-                )
-            except george.GeorgeError as exc:
-                raise ToolError(self._render_diagnostics(layer, frame_set, out_dir, exc)) from exc
-        finally:
-            with contextlib.suppress(Exception):
-                george.tv_background_set(background[0], background[1])
-            with contextlib.suppress(Exception):
-                george.tv_alpha_save_mode_set(alpha_save)
-            with contextlib.suppress(Exception):
-                george.tv_save_mode_set(save_mode[0], *save_mode[1])
-            with contextlib.suppress(Exception):
-                layer.opacity = opacity
-            with contextlib.suppress(Exception):
-                layer.blending_mode = blending
-            for lyr, was_visible in visibility:
-                with contextlib.suppress(Exception):
-                    if lyr.is_visible != was_visible:
-                        lyr.is_visible = was_visible
-            with contextlib.suppress(Exception):
-                layer.make_current()
+        project = layer.project
+        size = (project.width, project.height)
+        start_frame = project.start_frame
 
-        if not isinstance(seq, FileSequence):
-            seq = FileSequence(str(seq))
-        return {s: Path(seq.frame(s)) for s in starts if Path(seq.frame(s)).exists()}
+        restore = self._snapshot_render_state(layer, clip)
+        attempts: list[str] = []
+        try:
+            self._isolate_layer(layer, clip)
+            strategy = self._pick_strategy(layer, clip, starts[0], start_frame, size, out_dir, attempts)
+            if strategy is None:
+                raise ToolError(self._render_diagnostics(layer, starts, out_dir, attempts))
+            result: dict[int, Path] = {}
+            for frame in starts:
+                try:
+                    result[frame] = self._render_one(strategy, layer, clip, frame, start_frame, size, out_dir)
+                except Exception as exc:  # noqa: BLE001
+                    attempts.append(f"{strategy} 프레임 {frame}: {exc}")
+                    raise ToolError(self._render_diagnostics(layer, starts, out_dir, attempts)) from exc
+            return result
+        finally:
+            restore()
+
+    @property
+    def render_method(self) -> str | None:
+        return self._strategy
+
+    def _snapshot_render_state(self, layer: Layer, clip):
+        """렌더 전에 바꾸는 모든 설정을 저장하고, 되돌리는 함수를 돌려준다 (오류가 나도 반드시 호출됨)."""
+
+        def safe(fn):
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001
+                return None
+
+        visibility = [(lyr, safe(lambda l=lyr: l.is_visible)) for lyr in clip.layers]
+        opacity = safe(lambda: layer.opacity)
+        blending = safe(lambda: layer.blending_mode)
+        background = safe(george.tv_background_get)
+        alpha_save = safe(george.tv_alpha_save_mode_get)
+        save_mode = safe(george.tv_save_mode_get)
+        frame = safe(lambda: clip.current_frame)
+
+        def restore() -> None:
+            steps = []
+            if background is not None:
+                steps.append(lambda: george.tv_background_set(background[0], background[1]))
+            if alpha_save is not None:
+                steps.append(lambda: george.tv_alpha_save_mode_set(alpha_save))
+            if save_mode is not None:
+                steps.append(lambda: george.tv_save_mode_set(save_mode[0], *save_mode[1]))
+            if opacity is not None:
+                steps.append(lambda: setattr(layer, "opacity", opacity))
+            if blending is not None:
+                steps.append(lambda: setattr(layer, "blending_mode", blending))
+            for lyr, was_visible in visibility:
+                if was_visible is not None:
+                    steps.append(lambda l=lyr, v=was_visible: l.is_visible != v and setattr(l, "is_visible", v))
+            if frame is not None:
+                steps.append(lambda: setattr(clip, "current_frame", frame))
+            steps.append(layer.make_current)
+            for step in steps:
+                with contextlib.suppress(Exception):
+                    step()
+
+        return restore
 
     @staticmethod
-    def _render_diagnostics(layer: Layer, frame_set: FrameSet, out_dir: Path, exc: Exception) -> str:
-        """렌더 실패 시 원인 파악용 정보를 모은다."""
-        info = [f"TVPaint가 이미지 저장을 거부했습니다 ({exc}).", "", "--- 진단 정보 (이 내용을 그대로 전달해 주세요) ---"]
+    def _isolate_layer(layer: Layer, clip) -> None:
+        layer.opacity = 100
+        layer.blending_mode = george.BlendingMode.COLOR
+        for lyr in clip.layers:
+            want = lyr.id == layer.id
+            if lyr.is_visible != want:
+                lyr.is_visible = want
+        george.tv_save_mode_set(george.SaveFormat.PNG)
+        george.tv_alpha_save_mode_set(george.AlphaSaveMode.NO_PREMULTIPLY)
+        george.tv_background_set(george.BackgroundMode.NONE)
+        layer.make_current()
+
+    def _pick_strategy(self, layer, clip, frame, start_frame, size, out_dir, attempts) -> str | None:
+        if self._strategy is not None:
+            return self._strategy
+        for name in self.STRATEGIES:
+            try:
+                self._render_one(name, layer, clip, frame, start_frame, size, out_dir / f"probe_{name}")
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(f"{name}: 실패 ({exc})")
+                continue
+            attempts.append(f"{name}: 성공")
+            self._strategy = name
+            return name
+        return None
+
+    @staticmethod
+    def _render_one(name, layer, clip, frame, start_frame, size, out_dir: Path) -> Path:
+        """프레임 하나를 전용 빈 폴더에 저장하고, 생긴 PNG 한 장을 검증해서 돌려준다."""
+        from PIL import Image
+
+        target = out_dir / f"f{frame:06d}"
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / "img.png"
+        real = frame - start_frame  # TVPaint 내부 프레임 번호 (0 부터)
+
+        clip.current_frame = frame
+        layer.make_current()
+        if name == "ProjectSaveSequence":
+            george.tv_project_save_sequence(path, start=real, end=real)
+        elif name == "SaveSequence":
+            george.tv_save_sequence(path, real, real)
+        elif name == "SaveImage":
+            george.tv_save_image(path)
+        elif name == "SaveDisplay":
+            george.tv_save_display(path)
+        else:
+            raise ValueError(name)
+
+        files = sorted(target.glob("*.png"))
+        if len(files) != 1:
+            raise RuntimeError(f"PNG {len(files)}개 생성됨")
+        with Image.open(files[0]) as im:
+            if im.size != size:
+                raise RuntimeError(f"크기 {im.size[0]}x{im.size[1]} (캔버스 {size[0]}x{size[1]})")
+            if im.mode != "RGBA":  # 팔레트/흑백/알파 없음은 픽셀 손실 가능성이 있어 쓰지 않는다
+                raise RuntimeError(f"RGBA 아님 (mode={im.mode})")
+        return files[0]
+
+    @staticmethod
+    def _render_diagnostics(layer: Layer, starts: list[int], out_dir: Path, attempts: list[str]) -> str:
+        info = ["TVPaint에서 레이어 이미지를 저장하지 못했습니다.", "", "--- 진단 정보 (이 내용을 그대로 전달해 주세요) ---"]
+        info += attempts
         probes = {
-            "렌더 요청 프레임": lambda: str(frame_set),
+            "요청 프레임": lambda: f"{starts[:8]}{' ...' if len(starts) > 8 else ''}",
             "임시 폴더": lambda: str(out_dir),
             "레이어 start/end": lambda: f"{layer.start} / {layer.end}",
             "클립 start/end": lambda: f"{layer.clip.start} / {layer.clip.end}",
-            "클립 timeline_start": lambda: str(layer.clip.timeline_start),
-            "클립 mark in/out": lambda: f"{layer.clip.mark_in} / {layer.clip.mark_out}",
             "프로젝트 start_frame": lambda: str(layer.project.start_frame),
-            "프로젝트 경로": lambda: str(layer.project.path),
+            "캔버스": lambda: f"{layer.project.width}x{layer.project.height}",
+            "프로젝트 경로(원문)": lambda: repr(george.tv_get_project_name()),
         }
-        probes["기본 설정 저장 테스트"] = lambda: TVPaintBackend._save_probe(layer)
         for label, probe in probes.items():
             try:
                 info.append(f"{label}: {probe()}")
             except Exception as e:  # noqa: BLE001
                 info.append(f"{label}: (읽기 실패: {e})")
         return "\n".join(info)
-
-    @staticmethod
-    def _save_probe(layer: Layer) -> str:
-        """우리 설정을 전부 되돌린 상태에서, 영문 경로에 현재 프레임 1장을 저장해 본다."""
-        import os
-
-        probe = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "tvp_autocrop_probe.png"
-        real = layer.clip.current_frame - layer.project.start_frame
-        try:
-            george.tv_project_save_sequence(probe, start=real, end=real)
-        except Exception as e:  # noqa: BLE001
-            return f"실패 ({e}) 경로={probe} 프레임={real}"
-        ok = probe.exists()
-        with contextlib.suppress(OSError):
-            probe.unlink()
-        return f"성공 (파일 생성={ok}) 경로={probe} 프레임={real}"
 
     # ---------- 편집 ----------
     @contextlib.contextmanager

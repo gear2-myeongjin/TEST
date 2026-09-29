@@ -102,6 +102,11 @@ def _render_and_analyze(backend: Backend, layer: LayerRef, work: Path, progress:
     return instances, files, infos
 
 
+def _method_note(backend: Backend) -> str:
+    method = getattr(backend, "render_method", None)
+    return f"\n(이미지 저장 방식: {method})" if method else ""
+
+
 def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progress) -> str:
     layer = backend.current_layer()
     _check_layer(layer, expected_layer_id)
@@ -139,6 +144,9 @@ def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progr
             f"빈 프레임 {plan.removed_empty}개, 중복 {plan.removed_duplicate}개 삭제, 콤마 {plan.shortened}개 축소",
             "TVPaint에서 실행취소(Ctrl+Z) 한 번으로 되돌릴 수 있습니다.",
         ]
+        note = _method_note(backend)
+        if note:
+            lines.append(note.strip())
         if not ok:
             lines.append(
                 f"\n⚠ 검증 불일치: 예상 {plan.kept}장, 실제 {len(after)}개 인스턴스. "
@@ -188,6 +196,7 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
             f"크기 {spec.width}×{spec.height} (원본 캔버스 기준 X {left}, Y {top})\n"
             f"인스턴스 {len(instances)}개, 콤마 구조 유지, 원본 프로젝트는 변경되지 않았습니다.\n"
             "새 프로젝트는 아직 저장되지 않았습니다."
+            + _method_note(backend)
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
