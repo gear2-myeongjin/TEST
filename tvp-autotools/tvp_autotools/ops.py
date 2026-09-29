@@ -57,6 +57,22 @@ class Backend(Protocol):
     def build_cropped_project(self, spec: CropSpec) -> str: ...
 
 
+def _make_workdir() -> Path:
+    """임시 작업 폴더. TVPaint 가 한글/공백이 섞인 경로에 저장하지 못할 수 있어 영문 경로를 우선 고른다."""
+    import os
+
+    candidates = [tempfile.gettempdir(), os.environ.get("ProgramData", ""), os.environ.get("PUBLIC", "")]
+    for base in candidates:
+        if base and base.isascii() and " " not in base and os.path.isdir(base):
+            try:
+                root = Path(base) / "tvp_autocrop_tmp"
+                root.mkdir(exist_ok=True)
+                return Path(tempfile.mkdtemp(prefix="w_", dir=root))
+            except OSError:
+                continue
+    return Path(tempfile.mkdtemp(prefix="tvp_autocrop_"))
+
+
 def _check_layer(layer: LayerRef, expected_id: int | None) -> None:
     if expected_id is not None and layer.id != expected_id:
         raise ToolError(
@@ -92,7 +108,7 @@ def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progr
     if layer.is_locked:
         raise ToolError(f"'{layer.name}' 레이어가 잠겨 있습니다. 잠금을 풀고 다시 실행해 주세요.")
 
-    work = Path(tempfile.mkdtemp(prefix="tvp_autotools_"))
+    work = _make_workdir()
     try:
         instances, _files, infos = _render_and_analyze(backend, layer, work, progress)
         plan = plan_compaction(instances, infos)
@@ -104,7 +120,7 @@ def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progr
             return f"'{layer.name}': 정리할 프레임이 없습니다. (이미 {plan.kept}장 1콤마)"
 
         progress("프레임 정리 중", 0.72)
-        with backend.undo_group("AutoTools_CleanFrames"):
+        with backend.undo_group("AutoCrop_CleanFrames"):
             total = len(plan.actions)
             for n, action in enumerate(plan.actions):
                 if action.kind == "delete":
@@ -138,7 +154,7 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
     layer = backend.current_layer()
     _check_layer(layer, expected_layer_id)
 
-    work = Path(tempfile.mkdtemp(prefix="tvp_autotools_"))
+    work = _make_workdir()
     try:
         instances, files, infos = _render_and_analyze(backend, layer, work, progress)
         bbox = union_bbox([i.bbox for i in infos])

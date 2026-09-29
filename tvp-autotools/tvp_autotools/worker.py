@@ -35,8 +35,10 @@ class Worker:
                 value = job()
             except BaseException as exc:  # noqa: BLE001
                 tb = traceback.format_exc()
-                self.results.put(lambda e=exc, t=tb: on_error(e, t))
+                self.results.put(lambda e=exc, t=tb, cb=on_error: cb(e, t))
             else:
-                self.results.put(lambda v=value: on_done(v))
+                self.results.put(lambda v=value, cb=on_done: cb(v))
             finally:
                 self.busy = False
+        # 주의: 콜백은 반드시 기본 인자(cb=...)로 묶어야 한다. 그냥 참조하면 UI 가 결과를 꺼내기 전에
+        # 다음 작업을 가져왔을 때 '새 작업의 콜백'에 '이전 작업의 결과'가 전달된다.

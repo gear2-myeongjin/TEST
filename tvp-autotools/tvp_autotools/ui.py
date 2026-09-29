@@ -37,7 +37,7 @@ F_BODY = (FONT, 9)
 F_LAYER = (FONT, 11, "bold")
 F_BUTTON = (FONT, 10)
 
-POLL_MS = 1500
+POLL_MS = 300  # 가벼운 조회(레이어 id, 이름)만 하므로 짧게 잡는다
 
 
 class FlatButton(tk.Label):
@@ -79,7 +79,7 @@ class Progress(tk.Canvas):
 class App:
     def __init__(self, backend_factory: Callable[[], object]) -> None:
         self.root = tk.Tk()
-        self.root.title("TVPaint Auto Tools")
+        self.root.title("TVPaint Auto Crop")
         self.root.configure(bg=C["window"])
         self.root.resizable(False, False)
         self._set_icon()
@@ -221,17 +221,28 @@ class App:
             self._schedule_poll()
             return
         self._poll_pending = True
+        shown = (self.layer.id, self.layer.name) if self.layer else None
+
+        def job():
+            sig = self.backend.layer_signature()
+            # 레이어가 바뀌었거나 이름이 바뀐 경우에만 전체 정보를 다시 읽는다
+            return self.backend.current_layer() if sig != shown else None
 
         def done(layer):
             self._poll_pending = False
-            self._show_layer(layer)
+            if layer is not None:
+                self._show_layer(layer)
             self._schedule_poll()
 
         def fail(exc, tb):
             self._poll_pending = False
-            self._on_connect_failed(exc, tb)
+            if isinstance(exc, (ConnectionError, OSError)):
+                self._on_connect_failed(exc, tb)
+            else:
+                # 일시적인 조회 실패(TVPaint 가 바쁜 순간 등)는 연결 끊김으로 보지 않고 다시 시도한다
+                self._schedule_poll()
 
-        self.worker.submit(lambda: self.backend.current_layer(), done, fail)
+        self.worker.submit(job, done, fail)
 
     def _show_layer(self, layer: LayerRef) -> None:
         self.layer = layer

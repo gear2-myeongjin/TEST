@@ -53,6 +53,11 @@ class TVPaintBackend:
             project_name=layer.project.name,
         )
 
+    def layer_signature(self) -> tuple[int, str]:
+        """실시간 표시용 가벼운 조회 (RPC 2회). 바뀌었을 때만 current_layer() 로 전체 정보를 읽는다."""
+        layer_id = george.tv_layer_current_id()
+        return layer_id, george.tv_layer_info(layer_id).name
+
     def _layer(self, ref: LayerRef) -> Layer:
         layer = self._layer_cache.get(ref.id)
         if layer is None:
@@ -91,18 +96,32 @@ class TVPaintBackend:
         visibility = [(lyr, lyr.is_visible) for lyr in clip.layers]
         opacity = layer.opacity
         blending = layer.blending_mode
+        # PyTVPaint 렌더 도중 오류가 나면 배경/저장 설정이 복구되지 않으므로 직접 저장해 두었다가 되돌린다
+        background = george.tv_background_get()
+        alpha_save = george.tv_alpha_save_mode_get()
+        save_mode = george.tv_save_mode_get()
+        frame_set = FrameSet(sorted(starts))
         try:
             layer.opacity = 100
             layer.blending_mode = george.BlendingMode.COLOR
             pattern = str(out_dir / "inst.#.png")
-            seq = clip.render(
-                pattern,
-                frame_set=FrameSet(sorted(starts)),
-                layer_selection=[layer],
-                alpha_mode=george.AlphaSaveMode.NO_PREMULTIPLY,
-                background_mode=george.BackgroundMode.NONE,
-            )
+            try:
+                seq = clip.render(
+                    pattern,
+                    frame_set=frame_set,
+                    layer_selection=[layer],
+                    alpha_mode=george.AlphaSaveMode.NO_PREMULTIPLY,
+                    background_mode=george.BackgroundMode.NONE,
+                )
+            except george.GeorgeError as exc:
+                raise ToolError(self._render_diagnostics(layer, frame_set, out_dir, exc)) from exc
         finally:
+            with contextlib.suppress(Exception):
+                george.tv_background_set(background[0], background[1])
+            with contextlib.suppress(Exception):
+                george.tv_alpha_save_mode_set(alpha_save)
+            with contextlib.suppress(Exception):
+                george.tv_save_mode_set(save_mode[0], *save_mode[1])
             with contextlib.suppress(Exception):
                 layer.opacity = opacity
             with contextlib.suppress(Exception):
@@ -117,6 +136,44 @@ class TVPaintBackend:
         if not isinstance(seq, FileSequence):
             seq = FileSequence(str(seq))
         return {s: Path(seq.frame(s)) for s in starts if Path(seq.frame(s)).exists()}
+
+    @staticmethod
+    def _render_diagnostics(layer: Layer, frame_set: FrameSet, out_dir: Path, exc: Exception) -> str:
+        """렌더 실패 시 원인 파악용 정보를 모은다."""
+        info = [f"TVPaint가 이미지 저장을 거부했습니다 ({exc}).", "", "--- 진단 정보 (이 내용을 그대로 전달해 주세요) ---"]
+        probes = {
+            "렌더 요청 프레임": lambda: str(frame_set),
+            "임시 폴더": lambda: str(out_dir),
+            "레이어 start/end": lambda: f"{layer.start} / {layer.end}",
+            "클립 start/end": lambda: f"{layer.clip.start} / {layer.clip.end}",
+            "클립 timeline_start": lambda: str(layer.clip.timeline_start),
+            "클립 mark in/out": lambda: f"{layer.clip.mark_in} / {layer.clip.mark_out}",
+            "프로젝트 start_frame": lambda: str(layer.project.start_frame),
+            "프로젝트 경로": lambda: str(layer.project.path),
+        }
+        probes["기본 설정 저장 테스트"] = lambda: TVPaintBackend._save_probe(layer)
+        for label, probe in probes.items():
+            try:
+                info.append(f"{label}: {probe()}")
+            except Exception as e:  # noqa: BLE001
+                info.append(f"{label}: (읽기 실패: {e})")
+        return "\n".join(info)
+
+    @staticmethod
+    def _save_probe(layer: Layer) -> str:
+        """우리 설정을 전부 되돌린 상태에서, 영문 경로에 현재 프레임 1장을 저장해 본다."""
+        import os
+
+        probe = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "tvp_autocrop_probe.png"
+        real = layer.clip.current_frame - layer.project.start_frame
+        try:
+            george.tv_project_save_sequence(probe, start=real, end=real)
+        except Exception as e:  # noqa: BLE001
+            return f"실패 ({e}) 경로={probe} 프레임={real}"
+        ok = probe.exists()
+        with contextlib.suppress(OSError):
+            probe.unlink()
+        return f"성공 (파일 생성={ok}) 경로={probe} 프레임={real}"
 
     # ---------- 편집 ----------
     @contextlib.contextmanager
