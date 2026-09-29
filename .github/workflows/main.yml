@@ -7,6 +7,9 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tvp-autotools
     steps:
       - uses: actions/checkout@v4
 
@@ -41,4 +44,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: TVPaintAutoTools
-          path: dist/TVPaintAutoTools.exe
+          path: tvp-autotools/dist/TVPaintAutoTools.exe
