@@ -103,6 +103,9 @@ class TVPaintBackend:
             strategy = self._pick_strategy(layer, clip, starts[0], start_frame, size, out_dir, attempts)
             if strategy is None:
                 raise ToolError(self._render_diagnostics(layer, starts, out_dir, attempts))
+            batch = self._render_batch(strategy, layer, clip, starts, start_frame, size, out_dir)
+            if batch is not None:
+                return batch
             result: dict[int, Path] = {}
             for frame in starts:
                 try:
@@ -185,6 +188,48 @@ class TVPaintBackend:
             self._strategy = name
             return name
         return None
+
+    @staticmethod
+    def _render_batch(name, layer, clip, starts, start_frame, size, out_dir: Path) -> dict[int, Path] | None:
+        """구간 저장이 되는 방식이면 첫~마지막 인스턴스 구간을 명령 한 번으로 저장한다 (프레임마다 왕복하지 않음).
+
+        파일 수나 크기가 기대와 다르면 None 을 돌려주고, 호출한 쪽은 프레임별 저장으로 돌아간다.
+        """
+        import re
+
+        from PIL import Image
+
+        if name not in ("ProjectSaveSequence", "SaveSequence"):
+            return None
+        lo, hi = min(starts), max(starts)
+        target = out_dir / "batch"
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / "img.png"
+        try:
+            layer.make_current()
+            if name == "ProjectSaveSequence":
+                george.tv_project_save_sequence(path, start=lo - start_frame, end=hi - start_frame)
+            else:
+                george.tv_save_sequence(path, lo - start_frame, hi - start_frame)
+        except Exception:  # noqa: BLE001
+            return None
+
+        def number(p: Path) -> int:
+            digits = re.findall(r"\d+", p.stem)
+            return int(digits[-1]) if digits else -1
+
+        files = sorted(target.glob("*.png"), key=lambda p: (number(p), p.name))
+        if len(files) != hi - lo + 1:
+            return None
+        by_frame = {lo + i: f for i, f in enumerate(files)}
+        try:
+            for frame in starts:
+                with Image.open(by_frame[frame]) as im:
+                    if im.size != size or im.mode != "RGBA":
+                        return None
+        except Exception:  # noqa: BLE001
+            return None
+        return {frame: by_frame[frame] for frame in starts}
 
     @staticmethod
     def _render_one(name, layer, clip, frame, start_frame, size, out_dir: Path) -> Path:
@@ -279,58 +324,95 @@ class TVPaintBackend:
         pre_behavior = src_layer.pre_behavior
         post_behavior = src_layer.post_behavior
 
-        base_dir = src_project.path.parent if str(src_project.path) not in ("", ".") else Path.home()
-        stem = src_project.path.stem or "project"
-        new_path = base_dir / f"{safe_filename(stem)}_{safe_filename(spec.source.name)}_crop.tvpp"
+        new_path = self._crop_project_path(src_project, spec.source.name)
+        src_id = george.tv_project_current_id()
 
-        project = Project.new(new_path, spec.width, spec.height, par, fps, field, start_frame)
-        project.make_current()
-        clip = project.current_clip
-        defaults = list(clip.layers)
+        try:
+            project = Project.new(new_path, spec.width, spec.height, par, fps, field, start_frame)
+            project.make_current()
+            clip = project.current_clip
+            defaults = list(clip.layers)
 
-        layer = Layer.new_anim_layer(spec.source.name, clip)
-        for lyr in defaults:
-            if lyr.id != layer.id:
-                george.tv_layer_kill(lyr.id)
-        layer.make_current()
+            layer = Layer.new_anim_layer(spec.source.name, clip)
+            for lyr in defaults:
+                if lyr.id != layer.id:
+                    george.tv_layer_kill(lyr.id)
+            layer.make_current()
 
-        base = layer.start
-        clip.current_frame = base
-        for n, png in enumerate(spec.images):
-            if n > 0:
-                george.tv_layer_insert_image(count=1, direction=george.InsertDirection.AFTER)
-            george.tv_load_image(png)
+            base = layer.start
+            clip.current_frame = base
+            for n, png in enumerate(spec.images):
+                if n > 0:
+                    george.tv_layer_insert_image(count=1, direction=george.InsertDirection.AFTER)
+                george.tv_load_image(png)
 
-        # 콤마 복원: 뒤에서부터 늘려야 앞 인스턴스 위치가 밀리지 않는다
-        for n in reversed(range(len(spec.instances))):
-            length = spec.instances[n].length
-            if length > 1:
-                LayerInstance(layer, base + n).length = length
+            # 콤마 복원: 뒤에서부터 늘려야 앞 인스턴스 위치가 밀리지 않는다
+            for n in reversed(range(len(spec.instances))):
+                length = spec.instances[n].length
+                if length > 1:
+                    LayerInstance(layer, base + n).length = length
 
-        if src_start != layer.start:
-            layer.shift(src_start)
+            if src_start != layer.start:
+                layer.shift(src_start)
 
-        for attr, value in (
-            ("opacity", opacity),
-            ("blending_mode", blending),
-            ("pre_behavior", pre_behavior),
-            ("post_behavior", post_behavior),
-        ):
-            with contextlib.suppress(Exception):
-                setattr(layer, attr, value)
+            for attr, value in (
+                ("opacity", opacity),
+                ("blending_mode", blending),
+                ("pre_behavior", pre_behavior),
+                ("post_behavior", post_behavior),
+            ):
+                with contextlib.suppress(Exception):
+                    setattr(layer, attr, value)
 
-        clip.current_frame = layer.start
+            clip.current_frame = layer.start
 
-        # 구조 검증
-        built = self.instances(
-            LayerRef(layer.id, layer.name, True, False, clip.name, project.name)
-        )
-        expected = [i.length for i in spec.instances]
-        actual = [i.length for i in built]
-        if expected != actual:
-            raise ToolError(
-                "새 프로젝트의 콤마 구조가 원본과 다릅니다.\n"
-                f"원본 {len(expected)}개 / 결과 {len(actual)}개 인스턴스.\n"
-                "새 프로젝트는 열린 채로 두었으니 확인해 주세요. 원본은 변경되지 않았습니다."
+            # 구조 검증
+            built = self.instances(
+                LayerRef(layer.id, layer.name, True, False, clip.name, project.name)
             )
-        return project.name
+            expected = [i.length for i in spec.instances]
+            actual = [i.length for i in built]
+            if expected != actual:
+                raise ToolError(
+                    "새 프로젝트의 콤마 구조가 원본과 다릅니다.\n"
+                    f"원본 {len(expected)}개 / 결과 {len(actual)}개 인스턴스.\n"
+                    "새 프로젝트는 열린 채로 두었으니 확인해 주세요. 원본은 변경되지 않았습니다."
+                )
+            return project.name
+        except ToolError:
+            raise  # 구조 검증 실패: 확인할 수 있도록 새 프로젝트를 열어 둔다
+        except Exception:
+            # 생성 도중 실패하면 반쯤 만들어진 빈 프로젝트가 남지 않도록 닫고 원본으로 돌아간다
+            with contextlib.suppress(Exception):
+                current = george.tv_project_current_id()
+                if current != src_id:
+                    george.tv_project_close(current)
+            with contextlib.suppress(Exception):
+                george.tv_project_select(src_id)
+            raise
+
+    @staticmethod
+    def _crop_project_path(src_project: Project, layer_name: str) -> Path:
+        """새 프로젝트 경로. 저장 안 된 프로젝트는 TVPaint 가 경로를 따옴표 등으로 돌려주므로 정리해서 판단한다."""
+
+        def clean(text: str) -> str:
+            return text.strip().strip('"').strip("'").strip()
+
+        raw = ""
+        with contextlib.suppress(Exception):
+            raw = clean(george.tv_get_project_name())
+        if not raw:
+            with contextlib.suppress(Exception):
+                raw = clean(str(src_project.path))
+        src = Path(raw) if raw else None
+        if src is not None and src.suffix.lower() in (".tvpp", ".tvp") and src.parent.is_dir():
+            base_dir, stem = src.parent, src.stem
+        else:
+            docs = Path.home() / "Documents"
+            base_dir, stem = (docs if docs.is_dir() else Path.home()), "untitled"
+
+        def part(text: str) -> str:
+            cleaned = safe_filename(text).replace(" ", "_").replace("'", "_")
+            return cleaned if cleaned.strip("_") else "untitled"
+
+        return base_dir / f"{part(stem)}_{part(layer_name)}_crop.tvpp"
