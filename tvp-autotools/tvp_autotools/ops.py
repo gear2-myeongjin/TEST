@@ -5,6 +5,7 @@ TVPaint 호출은 전부 Backend 인터페이스를 통해서만 하므로, 테�
 
 from __future__ import annotations
 
+import contextlib
 import shutil
 import tempfile
 from contextlib import AbstractContextManager
@@ -132,6 +133,8 @@ def _method_note(backend: Backend) -> str:
 
 
 def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progress) -> str:
+    with contextlib.suppress(Exception):
+        backend.operation_label = "불필요 프레임 삭제"
     layer = backend.current_layer()
     _check_layer(layer, expected_layer_id)
     if layer.is_locked:
@@ -169,6 +172,8 @@ def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progr
 
 
 def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress) -> str:
+    with contextlib.suppress(Exception):
+        backend.operation_label = "Crop"
     layer = backend.current_layer()
     _check_layer(layer, expected_layer_id)
 
@@ -241,6 +246,8 @@ class AtlasPlan:
 
 def analyze_atlas(backend: Backend, expected_layer_id: int | None, progress: Progress) -> AtlasPlan:
     """현재 레이어의 타임라인 프레임을 있는 그대로, 공통 union bounds 크기의 셀로 만든다."""
+    with contextlib.suppress(Exception):
+        backend.operation_label = "Atlas 생성"
     layer = backend.current_layer()
     _check_layer(layer, expected_layer_id)
 

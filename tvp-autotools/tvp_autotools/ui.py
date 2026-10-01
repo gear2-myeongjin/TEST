@@ -47,6 +47,11 @@ F_LAYER = (FONT, 11, "bold")
 F_BUTTON = (FONT, 10)
 
 APP_TITLE = "TVPaint Auto Crop & Atlas Maker"
+WORK_WARNING = "작업이 끝날 때까지 TVPaint를 조작하지 마세요. 결과가 잘못되거나 작업 내용이 사라질 수 있습니다."
+NAME_WARNING = (
+    "레이어 이름에 영문이 아닌 글자가 있어, 작업 후 레이어 이름이 깨질 수 있습니다.\n"
+    "레이어 이름을 영문으로 바꾼 뒤 실행하는 것을 권장합니다."
+)
 
 POLL_MS = 300  # 가벼운 조회(레이어 id, 이름)만 하므로 짧게 잡는다
 
@@ -232,11 +237,40 @@ class App:
         self.worker.submit(job, self._on_connected, self._on_connect_failed)
 
     def _on_connected(self, layer: LayerRef) -> None:
+        first = not getattr(self, "_recovery_checked", False)
+        self._recovery_checked = True
         self.connected = True
         self.dot.config(fg=C["ok"])
         self.status.config(text="TVPaint 연결됨")
         self._show_layer(layer)
         self._schedule_poll()
+        if first:
+            self._check_recovery()
+
+    def _check_recovery(self) -> None:
+        """지난 작업이 중간에 끊겼으면(기록 파일이 남아 있으면) 복구를 제안한다."""
+        pending = getattr(self.backend, "pending_recovery", lambda: None)()
+        if not pending:
+            return
+        choice = ConfirmDialog(
+            self.root,
+            "지난 작업 복구",
+            (pending.get("layer") or {}).get("name", "?"),
+            self.backend.describe_recovery(pending),
+            question="복구하시겠습니까?",
+            layer_label="기록된 레이어:",
+        ).result
+        if not choice:
+            if ConfirmDialog(
+                self.root, "지난 작업 복구", (pending.get("layer") or {}).get("name", "?"),
+                "복구하지 않으면 기록을 지웁니다. 다음 실행 때 다시 묻지 않습니다.",
+                question="기록을 지우시겠습니까?",
+                layer_label="기록된 레이어:",
+                work_warning=False,
+            ).result:
+                self.backend.discard_recovery()
+            return
+        self._start(lambda p: self.backend.recover(pending), lambda msg: MessageDialog(self.root, "복구 결과", msg))
 
     def _on_connect_failed(self, exc: BaseException, tb: str) -> None:
         self.connected = False
@@ -320,7 +354,9 @@ class App:
                 detail = "빈 프레임과 중복 그림을 지우고 전부 1콤마로 만듭니다.\nCtrl+Z 한 번으로 되돌릴 수 있습니다."
                 fn = run_compact
                 button = self.btn_clean
-            if ConfirmDialog(self.root, title, layer.name, detail).result:
+            warnings = [NAME_WARNING] if which == "clean" and not layer.name.isascii() else []
+            question = "그래도 진행하시겠습니까?" if warnings else "정말 진행하시겠습니까?"
+            if ConfirmDialog(self.root, title, layer.name, detail, question=question, warnings=warnings).result:
                 self._start(lambda p: fn(self.backend, layer.id, p), self._show_summary, button)
 
         self.worker.submit(lambda: self.backend.current_layer(), got_layer, self._on_connect_failed)
@@ -436,14 +472,28 @@ class _Dialog(tk.Toplevel):
 
 
 class ConfirmDialog(_Dialog):
-    def __init__(self, master, title: str, layer_name: str, detail: str, question: str = "정말 진행하시겠습니까?"):
+    def __init__(
+        self,
+        master,
+        title: str,
+        layer_name: str,
+        detail: str,
+        question: str = "정말 진행하시겠습니까?",
+        warnings: list[str] | None = None,
+        layer_label: str = "현재 선택된 레이어:",
+        work_warning: bool = True,
+    ):
         super().__init__(master, title)
         self.result = False
-        tk.Label(self.body, text="현재 선택된 레이어:", fg=C["text_dim"], bg=C["window"], font=F_BODY).pack(anchor="w")
+        tk.Label(self.body, text=layer_label, fg=C["text_dim"], bg=C["window"], font=F_BODY).pack(anchor="w")
         box = tk.Frame(self.body, bg=C["field"], padx=8, pady=6)
         box.pack(fill="x", pady=(3, 10))
         tk.Label(box, text=layer_name, fg=C["text"], bg=C["field"], font=F_LAYER, anchor="w").pack(fill="x")
         tk.Label(self.body, text=detail, fg=C["text_dim"], bg=C["window"], font=F_SMALL, justify="left").pack(anchor="w")
+        for w in (warnings or []) + ([WORK_WARNING] if work_warning else []):
+            tk.Label(self.body, text=w, fg=C["warn"], bg=C["window"], font=F_SMALL, justify="left", wraplength=400).pack(
+                anchor="w", pady=(8, 0)
+            )
         tk.Label(self.body, text=question, fg=C["text"], bg=C["window"], font=F_BODY).pack(anchor="w", pady=(10, 12))
         row = tk.Frame(self.body, bg=C["window"])
         row.pack(fill="x")
@@ -552,6 +602,11 @@ class HelpDialog(_Dialog):
             text="주의 : 너무 큰 해상도는 렉과 오류를 유발합니다. 아틀라스의 사이즈가 10000px 이하가 되도록 작업해 주세요.",
             fg=C["warn"], bg=C["window"], font=F_BODY, justify="left", wraplength=460,
         ).pack(anchor="w", pady=(12, 0))
+        tk.Label(
+            self.body,
+            text="주의 : " + WORK_WARNING,
+            fg=C["warn"], bg=C["window"], font=F_BODY, justify="left", wraplength=460,
+        ).pack(anchor="w", pady=(6, 0))
 
         row = tk.Frame(self.body, bg=C["window"])
         row.pack(fill="x", pady=(14, 0))

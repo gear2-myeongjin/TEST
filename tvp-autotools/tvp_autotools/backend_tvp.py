@@ -24,6 +24,39 @@ from pytvpaint.project import Project  # noqa: E402
 from tvp_autotools.ops import CropSpec, LayerRef, ToolError  # noqa: E402
 
 
+# ---------- 작업 기록 (중단 복구용) ----------
+# 렌더링 전에 바꾸는 설정의 원래 값을 적어 두고, 정상적으로 되돌리면 지운다.
+# EXE 를 다시 켰을 때 파일이 남아 있으면 지난 작업이 중간에 끊긴 것이다.
+JOURNAL_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "TvpAAM" / "recovery.json"
+
+
+def _journal_write(data: dict) -> None:
+    import json
+
+    with contextlib.suppress(Exception):
+        JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = JOURNAL_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(JOURNAL_PATH)
+
+
+def _journal_clear() -> None:
+    with contextlib.suppress(Exception):
+        JOURNAL_PATH.unlink()
+
+
+def _journal_load() -> dict | None:
+    import json
+
+    with contextlib.suppress(Exception):
+        return json.loads(JOURNAL_PATH.read_text(encoding="utf-8"))
+    return None
+
+
+def _clean_path(text: str) -> str:
+    return str(text).strip().strip('"').strip("'").strip()
+
+
 class TVPaintBackend:
     def __init__(self) -> None:
         self._layer_cache: dict[int, Layer] = {}
@@ -299,6 +332,7 @@ class TVPaintBackend:
         alpha_save = safe(george.tv_alpha_save_mode_get)
         save_mode = safe(george.tv_save_mode_get)
         frame = safe(lambda: clip.current_frame)
+        self._journal_render_state(layer, visibility, opacity, blending, background, alpha_save, save_mode)
 
         def restore() -> None:
             steps = []
@@ -321,15 +355,22 @@ class TVPaintBackend:
             if frame is not None:
                 steps.append(("복구: 현재 프레임", lambda: setattr(clip, "current_frame", frame)))
             steps.append(("복구: 원본 레이어 선택", layer.make_current))
+            all_ok = True
             for _label, step in steps:
-                with contextlib.suppress(Exception):
+                try:
                     step()
+                except Exception:  # noqa: BLE001
+                    all_ok = False
             # 불투명도는 되돌린 뒤 실제 값을 다시 읽어 확인하고, 다르면 한 번 더 맞춘다
             if opacity is not None:
-                with contextlib.suppress(Exception):
+                try:
                     if not self._same(self._read_density(layer.id), opacity):
                         self._set_opacity(layer.id, opacity)
                         layer.make_current()
+                except Exception:  # noqa: BLE001
+                    all_ok = False
+            if all_ok:
+                _journal_clear()  # 전부 되돌렸으면 기록을 지운다. 하나라도 실패하면 다음 실행 때 복구를 제안한다
 
         restore.opacity = opacity
         return restore
@@ -459,6 +500,152 @@ class TVPaintBackend:
                 info.append(f"{label}: (읽기 실패: {e})")
         return "\n".join(info)
 
+    # ---------- 중단 복구 ----------
+    operation_label: str = ""
+
+    def _project_identity(self) -> tuple[str, str]:
+        path = name = ""
+        with contextlib.suppress(Exception):
+            path = _clean_path(george.tv_get_project_name())
+        with contextlib.suppress(Exception):
+            name = Path(path).stem if path.lower().endswith((".tvpp", ".tvp")) else ""
+        return path, name
+
+    def _journal_render_state(self, layer, visibility, opacity, blending, background, alpha_save, save_mode) -> None:
+        bg_args = None
+        if background is not None:
+            mode, color = background
+            bg_args = [mode.value]
+            if isinstance(color, tuple):
+                for c in color:
+                    bg_args += [c.r, c.g, c.b]
+            elif color is not None:
+                bg_args += [color.r, color.g, color.b]
+        path, name = self._project_identity()
+        position = None
+        with contextlib.suppress(Exception):
+            position = layer.position
+        _journal_write(
+            {
+                "stage": "render",
+                "operation": self.operation_label,
+                "time": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "project_path": path,
+                "project_name": name,
+                "layer": {"id": layer.id, "name": layer.name, "position": position},
+                "opacity": opacity,
+                "opacity_scale": (self._calibration or {}).get("scale"),
+                "blending": blending.value if blending is not None else None,
+                "background": bg_args,
+                "alpha_save": alpha_save.value if alpha_save is not None else None,
+                "save_mode": ([save_mode[0].value] + list(save_mode[1])) if save_mode is not None else None,
+                "visibility": [
+                    {"id": lyr.id, "name": lyr.name, "visible": vis} for lyr, vis in visibility if vis is not None
+                ],
+            }
+        )
+
+    @staticmethod
+    def pending_recovery() -> dict | None:
+        return _journal_load()
+
+    @staticmethod
+    def discard_recovery() -> None:
+        _journal_clear()
+
+    @staticmethod
+    def describe_recovery(j: dict) -> str:
+        op = j.get("operation") or "작업"
+        where = j.get("project_name") or "저장되지 않은 프로젝트"
+        layer = (j.get("layer") or {}).get("name", "?")
+        if j.get("stage") == "replace":
+            return (
+                f"지난 '{op}'이(가) 레이어를 바꿔 끼우는 도중에 끊겼습니다 ({j.get('time', '')}).\n"
+                f"프로젝트: {where} / 레이어: {layer}\n\n"
+                "원본 레이어가 지워졌거나 새 레이어가 덜 만들어졌을 수 있습니다.\n"
+                "TVPaint에서 실행취소(Ctrl+Z)로 작업 전 상태로 되돌려 주세요."
+            )
+        scale = j.get("opacity_scale")
+        op_val = j.get("opacity")
+        if op_val is None:
+            op_text = "?"
+        else:
+            op_text = f"{op_val * 100:.0f}%" if scale == "fraction" else f"{op_val:.0f}%"
+        return (
+            f"지난 '{op}'이(가) 끝나기 전에 끊겼습니다 ({j.get('time', '')}).\n"
+            f"프로젝트: {where} / 레이어: {layer}\n\n"
+            "다음 설정이 작업 중 상태로 남아 있을 수 있습니다.\n"
+            f"레이어 불투명도(원래 {op_text}), 블렌딩 모드(원래 {j.get('blending')}), "
+            "다른 레이어 표시 여부, 배경, 저장 형식\n\n"
+            "[진행]을 누르면 원래 값으로 되돌립니다. 해당 프로젝트가 TVPaint에서 선택돼 있어야 합니다."
+        )
+
+    def recover(self, j: dict) -> str:
+        """기록된 원래 설정으로 되돌린다. 성공하면 기록을 지우고, 대상을 못 찾으면 기록을 남긴 채 안내한다."""
+        from pytvpaint.george.client import send_cmd
+
+        if j.get("stage") == "replace":
+            _journal_clear()
+            return "기록을 지웠습니다. TVPaint에서 Ctrl+Z로 되돌렸는지 확인해 주세요."
+
+        path, _ = self._project_identity()
+        saved_path = j.get("project_path") or ""
+        if saved_path.lower().endswith((".tvpp", ".tvp")) and path != saved_path:
+            raise ToolError(
+                f"지금 선택된 프로젝트가 기록과 다릅니다.\n기록된 프로젝트: {saved_path}\n\n"
+                "TVPaint에서 해당 프로젝트를 선택한 뒤 EXE를 다시 실행해 주세요. 기록은 남겨 두었습니다."
+            )
+
+        clip = Layer.current_layer().clip
+        layers = list(clip.layers)
+        by_id = {lyr.id: lyr for lyr in layers}
+
+        def find(entry: dict):
+            lyr = by_id.get(entry.get("id"))
+            if lyr is not None and lyr.name == entry.get("name"):
+                return lyr
+            same = [l for l in layers if l.name == entry.get("name")]
+            return same[0] if len(same) == 1 else None
+
+        target = find(j.get("layer") or {})
+        if target is None:
+            raise ToolError(
+                "기록된 레이어를 지금 클립에서 찾지 못했습니다.\n"
+                "해당 클립을 선택한 뒤 EXE를 다시 실행하거나, 아래 값으로 직접 맞춰 주세요.\n\n"
+                + self.describe_recovery(j).split("\n\n")[1]
+            )
+
+        done, failed = [], []
+
+        def attempt(label: str, fn) -> None:
+            try:
+                fn()
+                done.append(label)
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"{label} ({exc})")
+
+        if j.get("background"):
+            attempt("배경", lambda: send_cmd("tv_Background", *j["background"]))
+        if j.get("alpha_save"):
+            attempt("알파 저장 방식", lambda: send_cmd("tv_AlphaSaveMode", j["alpha_save"]))
+        if j.get("save_mode"):
+            attempt("저장 형식", lambda: send_cmd("tv_SaveMode", *j["save_mode"]))
+        if j.get("blending"):
+            attempt("블렌딩 모드", lambda: send_cmd("tv_LayerBlendingMode", target.id, j["blending"]))
+        if j.get("opacity") is not None:
+            attempt("불투명도", lambda: self._set_opacity(target.id, j["opacity"]))
+        for entry in j.get("visibility") or []:
+            lyr = find(entry)
+            if lyr is not None:
+                attempt(f"표시 여부({lyr.name})", lambda l=lyr, v=entry["visible"]: george.tv_layer_display_set(l.id, v))
+        with contextlib.suppress(Exception):
+            target.make_current()
+
+        if failed:
+            return "일부만 복구했습니다.\n복구 실패: " + ", ".join(failed) + "\n\n기록은 남겨 두었습니다."
+        _journal_clear()
+        return "복구했습니다: " + ", ".join(done)
+
     # ---------- 편집 ----------
     @contextlib.contextmanager
     def undo_group(self, name: str) -> Iterator[None]:
@@ -523,27 +710,46 @@ class TVPaintBackend:
         new_id = self._load_images_as_layer(clip, images, work, "clean")
         new = Layer(layer_id=new_id, clip=clip)
 
-        george.tv_layer_kill(old.id)
-        george.tv_layer_rename(new_id, props["name"])
-        new.refresh()
-        if new.start != props["start"]:
-            new.shift(props["start"])
-        for attr in ("blending_mode", "pre_behavior", "post_behavior", "is_visible"):
+        path, name = self._project_identity()
+        _journal_write(
+            {
+                "stage": "replace",
+                "operation": self.operation_label,
+                "time": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "project_path": path,
+                "project_name": name,
+                "layer": {"id": old.id, "name": props["name"]},
+            }
+        )
+        try:
+            george.tv_layer_kill(old.id)
+            george.tv_layer_rename(new_id, props["name"])
+            new.refresh()
+            if new.start != props["start"]:
+                new.shift(props["start"])
+            for attr in ("blending_mode", "pre_behavior", "post_behavior", "is_visible"):
+                with contextlib.suppress(Exception):
+                    setattr(new, attr, props[attr])
+            if props["opacity"] is not None:
+                with contextlib.suppress(Exception):
+                    if not self._same(self._read_density(new_id), props["opacity"]):
+                        self._set_opacity(new_id, props["opacity"])
+            if color_index is not None:
+                with contextlib.suppress(Exception):
+                    george.tv_layer_color_set(new_id, color_index)
             with contextlib.suppress(Exception):
-                setattr(new, attr, props[attr])
-        if props["opacity"] is not None:
-            with contextlib.suppress(Exception):
-                if not self._same(self._read_density(new_id), props["opacity"]):
-                    self._set_opacity(new_id, props["opacity"])
-        if color_index is not None:
-            with contextlib.suppress(Exception):
-                george.tv_layer_color_set(new_id, color_index)
-        with contextlib.suppress(Exception):
-            new.position = props["position"]
-        new.make_current()
-        self._layer_cache = {new_id: new}
+                new.position = props["position"]
+            new.make_current()
+            self._layer_cache = {new_id: new}
 
+        except Exception as exc:
+            _journal_clear()  # 프로그램이 살아 있으므로 지금 바로 안내한다 (다음 실행 때 다시 묻지 않음)
+            raise ToolError(
+                f"레이어를 바꿔 끼우는 중 오류가 났습니다 ({exc}).\n"
+                "TVPaint에서 실행취소(Ctrl+Z)로 작업 전 상태로 되돌려 주세요."
+            ) from exc
         new.refresh()
+        _journal_clear()
         return new.end - new.start + 1
 
     # ---------- 크롭 프로젝트 ----------
