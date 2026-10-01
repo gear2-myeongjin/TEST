@@ -125,7 +125,7 @@ def _method_note(backend: Backend) -> str:
     if mode:
         lines.append(f"불투명도 처리: {mode}")
     cal = getattr(backend, "_calibration", None)
-    if cal and cal.get("log"):
+    if cal and cal.get("log") and cal.get("reader") is None:  # 안전 모드일 때만 원인 파악용 기록을 보여준다
         lines.append("--- 불투명도 시험 기록 ---")
         lines += cal["log"]
     return ("\n\n" + "\n".join(lines)) if lines else ""

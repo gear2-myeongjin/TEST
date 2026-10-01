@@ -102,7 +102,7 @@ class TVPaintBackend:
         if self._calibration is not None:
             return self._calibration
         log: list[str] = []
-        result = {"reader": None, "scale": None, "log": log}
+        result = {"reader": None, "scale": None, "destructive": False, "log": log}
         src_pid = src_lid = None
         with contextlib.suppress(Exception):
             src_pid = george.tv_project_current_id()
@@ -121,6 +121,7 @@ class TVPaintBackend:
                 "LayerDensity": lambda: self._to_float(self._raw_current_density(lid)),
             }
             ok: dict[tuple[str, str], bool] = {}
+            destructive = False
             for scale, value in (("fraction", 0.25), ("percent", 25.0), ("fraction", 0.75), ("percent", 75.0)):
                 try:
                     self._send_density(lid, value)
@@ -132,10 +133,11 @@ class TVPaintBackend:
                 raw_d1 = self._raw_current_density(lid)
                 raw_d2 = self._raw_current_density(lid)  # 두 번 읽어 읽기 자체가 값을 바꾸는지 확인
                 log.append(f"쓰기 {value} ({scale}) → LayerInfo={raw_i!r}, LayerDensity={raw_d1!r} / 재확인 {raw_d2!r}")
-                for name, got in (("LayerInfo", self._to_float(raw_i)), ("LayerDensity", self._to_float(raw_d1))):
+                got_d = self._to_float(raw_d1)
+                if raw_d1 != raw_d2:
+                    destructive = True  # 이 TVPaint 는 값 없는 tv_LayerDensity 가 값을 돌려준 뒤 0 으로 만든다
+                for name, got in (("LayerInfo", self._to_float(raw_i)), ("LayerDensity", got_d)):
                     match = got is not None and abs(got - value) < 1e-4
-                    if name == "LayerDensity" and raw_d1 != raw_d2:
-                        match = False  # 읽을 때마다 값이 바뀌면 쓸 수 없다
                     ok[(name, scale)] = ok.get((name, scale), True) and match
             for name in ("LayerInfo", "LayerDensity"):  # 부작용 없는 LayerInfo 를 먼저 고려
                 for scale in ("fraction", "percent"):
@@ -144,9 +146,13 @@ class TVPaintBackend:
                         break
                 if result["reader"]:
                     break
+            result["destructive"] = destructive and result["reader"] == "LayerDensity"
             if result["reader"]:
                 self._readers = readers
-            log.append(f"선택: 읽기={result['reader']}, 단위={result['scale']}")
+            log.append(
+                f"선택: 읽기={result['reader']}, 단위={result['scale']}"
+                + (" (읽은 직후 원래 값으로 되돌림)" if result.get("destructive") else "")
+            )
         except Exception as exc:  # noqa: BLE001
             log.append(f"보정 실패: {exc}")
         finally:
@@ -169,14 +175,19 @@ class TVPaintBackend:
             return "미확인"
         if cal["reader"] is None:
             return "안전 모드 (불투명도를 건드리지 않음)"
-        return f"{cal['reader']} 읽기, {'0~1' if cal['scale'] == 'fraction' else '0~100'} 단위"
+        mode = f"{cal['reader']} 읽기, {'0~1' if cal['scale'] == 'fraction' else '0~100'} 단위"
+        return mode + (", 읽은 직후 복원" if cal.get("destructive") else "")
 
     def _read_density(self, layer_id: int) -> float | None:
         cal = self._calibrate()
         if cal["reader"] == "LayerInfo":
             return self._to_float(self._raw_info_density(layer_id))
         if cal["reader"] == "LayerDensity":
-            return self._to_float(self._raw_current_density(layer_id))
+            value = self._to_float(self._raw_current_density(layer_id))
+            if cal.get("destructive") and value is not None:
+                # 읽기가 레이어를 0% 로 만들었으므로, 읽은 값을 즉시 다시 써서 원래대로 돌린다
+                self._send_density(layer_id, value)
+            return value
         return None  # 안전 모드: 값을 모르면 쓰지도 않는다
 
     def _write_density(self, layer_id: int, value: float) -> None:
@@ -647,6 +658,7 @@ class TVPaintBackend:
         field = src_project.field_order
         start_frame = src_project.start_frame
 
+        src_opacity = self._read_density(src_layer.id)  # Atlas 레이어도 원본 불투명도를 따른다
         new_path = self._new_project_path(src_project, "Atlas")
         src_id = george.tv_project_current_id()
         try:
@@ -666,6 +678,9 @@ class TVPaintBackend:
                     with contextlib.suppress(Exception):
                         george.tv_layer_kill(lid)
             george.tv_layer_rename(layer_id, "Atlas")
+            if src_opacity is not None:
+                with contextlib.suppress(Exception):
+                    self._set_opacity(layer_id, src_opacity)
             Layer(layer_id=layer_id, clip=clip).make_current()
             clip.current_frame = start_frame
             return project.name
