@@ -16,7 +16,8 @@ from tvp_autotools.core import (
     Instance,
     analyze_image,
     crop_image,
-    plan_compaction,
+    group_runs,
+    plan_frames,
     union_bbox,
 )
 
@@ -49,12 +50,11 @@ class CropSpec:
 
 class Backend(Protocol):
     def current_layer(self) -> LayerRef: ...
-    def instances(self, layer: LayerRef) -> list[Instance]: ...
-    def render_instances(self, layer: LayerRef, starts: list[int], out_dir: Path) -> dict[int, Path]: ...
+    def layer_range(self, layer: LayerRef) -> tuple[int, int]: ...
+    def render_frames(self, layer: LayerRef, frames: list[int], out_dir: Path) -> dict[int, Path]: ...
     def undo_group(self, name: str) -> AbstractContextManager[None]: ...
-    def delete_instance(self, layer: LayerRef, start: int, length: int) -> None: ...
-    def set_instance_length(self, layer: LayerRef, start: int, length: int) -> None: ...
-    def build_cropped_project(self, spec: CropSpec) -> str: ...
+    def replace_layer_frames(self, layer: LayerRef, images: list[Path], work: Path) -> int: ...
+    def build_cropped_project(self, spec: CropSpec, work: Path) -> str: ...
 
 
 def _make_workdir() -> Path:
@@ -83,23 +83,32 @@ def _check_layer(layer: LayerRef, expected_id: int | None) -> None:
         raise ToolError(f"'{layer.name}'은(는) 애니메이션 레이어가 아닙니다.")
 
 
+def _analyze_all(paths: list[Path]):
+    """PNG 분석을 CPU 코어 수만큼 병렬로 처리한다."""
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = max(1, min(8, (os.cpu_count() or 2)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(analyze_image, paths))
+
+
 def _render_and_analyze(backend: Backend, layer: LayerRef, work: Path, progress: Progress):
-    progress("인스턴스 구조 읽는 중", 0.05)
-    instances = backend.instances(layer)
-    if not instances:
+    progress("레이어 구간 읽는 중", 0.03)
+    start, end = backend.layer_range(layer)
+    frames = list(range(start, end + 1))
+    if not frames:
         raise ToolError("레이어에 프레임이 없습니다.")
 
-    progress(f"인스턴스 {len(instances)}개 렌더링 중", 0.15)
-    files = backend.render_instances(layer, [i.start for i in instances], work)
-    missing = [i.start for i in instances if i.start not in files]
+    progress(f"프레임 {len(frames)}개 렌더링 중", 0.08)
+    files = backend.render_frames(layer, frames, work)
+    missing = [f for f in frames if f not in files]
     if missing:
         raise ToolError(f"렌더링 결과를 찾지 못한 프레임이 있습니다: {missing[:10]}")
 
-    infos = []
-    for n, inst in enumerate(instances):
-        infos.append(analyze_image(files[inst.start]))
-        progress("픽셀 분석 중", 0.45 + 0.25 * (n + 1) / len(instances))
-    return instances, files, infos
+    progress("픽셀 분석 중", 0.5)
+    infos = _analyze_all([files[f] for f in frames])
+    return frames, files, infos
 
 
 def _method_note(backend: Backend) -> str:
@@ -115,45 +124,31 @@ def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progr
 
     work = _make_workdir()
     try:
-        instances, _files, infos = _render_and_analyze(backend, layer, work, progress)
-        plan = plan_compaction(instances, infos)
-
-        if plan.kept == 0:
+        frames, files, infos = _render_and_analyze(backend, layer, work, progress)
+        plan = plan_frames(frames, infos)
+        if not plan.keep:
             raise ToolError("레이어 전체가 빈 프레임입니다. 삭제하지 않았습니다.")
         if plan.is_noop:
             progress("완료", 1.0)
-            return f"'{layer.name}': 정리할 프레임이 없습니다. (이미 {plan.kept}장 1콤마)"
+            return f"'{layer.name}': 정리할 프레임이 없습니다. (이미 {len(plan.keep)}장 1콤마)" + _method_note(backend)
 
-        progress("프레임 정리 중", 0.72)
+        progress("레이어 다시 구성 중", 0.75)
         with backend.undo_group("AutoCrop_CleanFrames"):
-            total = len(plan.actions)
-            for n, action in enumerate(plan.actions):
-                if action.kind == "delete":
-                    backend.delete_instance(layer, action.start, action.length)
-                else:
-                    backend.set_instance_length(layer, action.start, 1)
-                progress("프레임 정리 중", 0.72 + 0.23 * (n + 1) / total)
-
-        progress("결과 검증 중", 0.97)
-        after = backend.instances(layer)
-        ok = len(after) == plan.kept and all(i.length == 1 for i in after)
+            result_count = backend.replace_layer_frames(layer, [files[f] for f in plan.keep], work)
 
         lines = [
             f"'{layer.name}' 정리 완료",
-            f"인스턴스 {len(instances)}개 → {plan.kept}장 (1콤마)",
-            f"빈 프레임 {plan.removed_empty}개, 중복 {plan.removed_duplicate}개 삭제, 콤마 {plan.shortened}개 축소",
+            f"프레임 {plan.total}개 → {len(plan.keep)}장 (1콤마)",
+            f"빈 프레임 {plan.removed_empty}개, 반복 그림(콤마·복사본) {plan.removed_repeat}개 정리",
             "TVPaint에서 실행취소(Ctrl+Z) 한 번으로 되돌릴 수 있습니다.",
         ]
-        note = _method_note(backend)
-        if note:
-            lines.append(note.strip())
-        if not ok:
+        if result_count != len(plan.keep):
             lines.append(
-                f"\n⚠ 검증 불일치: 예상 {plan.kept}장, 실제 {len(after)}개 인스턴스. "
+                f"\n⚠ 검증 불일치: 예상 {len(plan.keep)}프레임, 실제 {result_count}프레임. "
                 "결과를 확인하고 문제가 있으면 Ctrl+Z로 되돌려 주세요."
             )
         progress("완료", 1.0)
-        return "\n".join(lines)
+        return "\n".join(lines) + _method_note(backend)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -164,18 +159,20 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
 
     work = _make_workdir()
     try:
-        instances, files, infos = _render_and_analyze(backend, layer, work, progress)
+        frames, files, infos = _render_and_analyze(backend, layer, work, progress)
         bbox = union_bbox([i.bbox for i in infos])
         if bbox is None:
             raise ToolError("레이어 전체가 빈 프레임이라 크롭할 영역이 없습니다.")
 
-        progress("크롭 이미지 만드는 중", 0.75)
+        # 같은 그림이 이어지는 구간은 한 장 + 콤마로 되살린다 (빈 프레임 구간도 그대로 유지)
+        runs = group_runs(frames, infos)
+        progress("크롭 이미지 만드는 중", 0.7)
         cropped_dir = work / "cropped"
         cropped_dir.mkdir()
         cropped: list[Path] = []
-        for n, inst in enumerate(instances):
-            dst = cropped_dir / f"c{n:05d}.png"
-            crop_image(files[inst.start], dst, bbox)
+        for n, (start, _length) in enumerate(runs):
+            dst = cropped_dir / f"crop_{n:05d}.png"
+            crop_image(files[start], dst, bbox)
             cropped.append(dst)
 
         left, top, right, bottom = bbox
@@ -184,17 +181,17 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
             width=right - left,
             height=bottom - top,
             offset=(left, top),
-            instances=instances,
+            instances=[Instance(start, length) for start, length in runs],
             images=cropped,
         )
-        progress("새 프로젝트 생성 중", 0.85)
-        project_name = backend.build_cropped_project(spec)
+        progress("새 프로젝트 생성 중", 0.82)
+        project_name = backend.build_cropped_project(spec, work)
         progress("완료", 1.0)
         return (
             f"'{layer.name}' 크롭 완료\n"
             f"새 프로젝트: {project_name}\n"
             f"크기 {spec.width}×{spec.height} (원본 캔버스 기준 X {left}, Y {top})\n"
-            f"인스턴스 {len(instances)}개, 콤마 구조 유지, 원본 프로젝트는 변경되지 않았습니다.\n"
+            f"프레임 {len(frames)}개, 그림 {len(runs)}장 + 콤마 구조 유지, 원본 프로젝트는 변경되지 않았습니다.\n"
             "새 프로젝트는 아직 저장되지 않았습니다."
             + _method_note(backend)
         )

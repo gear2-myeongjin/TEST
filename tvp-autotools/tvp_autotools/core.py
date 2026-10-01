@@ -126,3 +126,51 @@ def safe_filename(name: str) -> str:
     bad = '<>:"/\\|?*'
     cleaned = "".join("_" if c in bad or ord(c) < 32 else c for c in name).strip(" .")
     return cleaned or "layer"
+
+
+# ---------------- 프레임 단위 계획 ----------------
+# TVPaint 의 인스턴스 탐색(tv_ExposureNext)은 빈 이미지를 건너뛰므로 인스턴스 구조를 믿지 않고,
+# 레이어 구간의 모든 프레임을 렌더해서 실제 픽셀만으로 판단한다.
+
+
+@dataclass(frozen=True)
+class FramePlan:
+    keep: list[int]  # 남길 프레임 번호 (순서대로, 결과는 각 1콤마)
+    total: int
+    removed_empty: int  # 빈 프레임 수
+    removed_repeat: int  # 직전 그림과 같은 프레임 수 (콤마로 늘어난 것 + 복사본)
+
+    @property
+    def is_noop(self) -> bool:
+        return len(self.keep) == self.total
+
+
+def plan_frames(frames: list[int], infos: list[ImageInfo]) -> FramePlan:
+    """빈 프레임 제거 + 직전에 남긴 그림과 같은 프레임 제거. 결과는 남은 그림이 1장씩."""
+    keep: list[int] = []
+    prev: str | None = None
+    empty = repeat = 0
+    for frame, info in zip(frames, infos):
+        if info.empty:
+            empty += 1
+            continue
+        if info.signature == prev:
+            repeat += 1
+            continue
+        prev = info.signature
+        keep.append(frame)
+    return FramePlan(keep=keep, total=len(frames), removed_empty=empty, removed_repeat=repeat)
+
+
+def group_runs(frames: list[int], infos: list[ImageInfo]) -> list[tuple[int, int]]:
+    """연속으로 같은 그림(빈 프레임 포함)인 구간을 (시작 프레임, 길이)로 묶는다. Crop 의 콤마 복원용."""
+    runs: list[tuple[int, int]] = []
+    prev: str | None = None
+    for frame, info in zip(frames, infos):
+        if runs and info.signature == prev:
+            start, length = runs[-1]
+            runs[-1] = (start, length + 1)
+        else:
+            runs.append((frame, 1))
+            prev = info.signature
+    return runs

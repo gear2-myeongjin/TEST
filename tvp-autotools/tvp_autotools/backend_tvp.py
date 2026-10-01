@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 from pathlib import Path
 from typing import Iterator
 
@@ -16,10 +17,10 @@ os.environ.setdefault("PYTVPAINT_LOG_LEVEL", "WARNING")
 
 from pytvpaint import george  # noqa: E402
 from pytvpaint.george.client import rpc_client  # noqa: E402
-from pytvpaint.layer import Layer, LayerInstance  # noqa: E402
+from pytvpaint.layer import Layer  # noqa: E402
 from pytvpaint.project import Project  # noqa: E402
 
-from tvp_autotools.core import Instance, safe_filename  # noqa: E402
+from tvp_autotools.core import safe_filename  # noqa: E402
 from tvp_autotools.ops import CropSpec, LayerRef, ToolError  # noqa: E402
 
 
@@ -66,30 +67,17 @@ class TVPaintBackend:
         layer.make_current()
         return layer
 
-    def instances(self, ref: LayerRef) -> list[Instance]:
+    def layer_range(self, ref: LayerRef) -> tuple[int, int]:
         layer = self._layer(ref)
         layer.refresh()
-        starts: list[int] = []
-        current = LayerInstance(layer, layer.start)
-        while True:
-            starts.append(current.start)
-            nxt = current.next
-            if nxt is None:
-                break
-            current = nxt
-        end = layer.end
-        result = []
-        for i, s in enumerate(starts):
-            stop = starts[i + 1] - 1 if i + 1 < len(starts) else end
-            result.append(Instance(start=s, length=stop - s + 1))
-        return result
+        return layer.start, layer.end
 
     # ---------- 렌더 ----------
     # TVPaint 환경에 따라 특정 저장 명령이 -1 을 돌려주는 경우가 있어, 여러 방식을 첫 프레임에 시험해 보고
     # 제대로 된 PNG(캔버스 크기)를 만드는 첫 번째 방식을 이후 프레임에 사용한다.
     STRATEGIES = ("ProjectSaveSequence", "SaveSequence", "SaveImage", "SaveDisplay")
 
-    def render_instances(self, ref: LayerRef, starts: list[int], out_dir: Path) -> dict[int, Path]:
+    def render_frames(self, ref: LayerRef, starts: list[int], out_dir: Path) -> dict[int, Path]:
         layer = self._layer(ref)
         clip = layer.clip
         project = layer.project
@@ -295,22 +283,80 @@ class TVPaintBackend:
             # 중간에 오류가 나도 스택은 반드시 닫는다 (열린 채로 남으면 TVPaint 실행취소가 꼬임)
             george.tv_undo_close_stack(name)
 
-    def delete_instance(self, ref: LayerRef, start: int, length: int) -> None:
-        layer = self._layer(ref)
-        layer.select_frames(start, start + length - 1)
-        selected = layer.selected_frames
-        if len(selected) != length:
-            layer.clear_selection()
-            raise ToolError(f"프레임 {start} 선택 실패 (요청 {length}, 실제 {len(selected)}). 작업을 중단했습니다.")
-        george.tv_layer_cut()
-        layer.clear_selection()
+    def _load_images_as_layer(self, clip, images: list[Path], work: Path, tag: str) -> int:
+        """PNG 들을 TVPaint 시퀀스 불러오기 한 번으로 새 레이어(각 1콤마)로 만든다. 새 레이어 id 를 돌려준다."""
+        seq_dir = work / f"seq_{tag}"
+        seq_dir.mkdir(parents=True, exist_ok=True)
+        first = None
+        for n, src in enumerate(images):
+            dst = seq_dir / f"img_{n:05d}.png"
+            shutil.copyfile(src, dst)
+            first = first or dst
+        if first is None:
+            raise ToolError("불러올 이미지가 없습니다.")
 
-    def set_instance_length(self, ref: LayerRef, start: int, length: int) -> None:
-        layer = self._layer(ref)
-        LayerInstance(layer, start).length = length
+        before = {lyr.id for lyr in clip.layers}
+        # preload: 이미지를 TVPaint 메모리에 올려 임시 파일과의 연결을 끊는다 (작업 후 임시 폴더를 지우므로 필수)
+        george.tv_load_sequence(first, preload=True)
+        # 반환값이 문서마다 '이미지 수' / '레이어 id' 로 달라서 믿지 않고, 새로 생긴 레이어를 직접 찾는다
+        created = [lyr for lyr in clip.layers if lyr.id not in before]
+        if len(created) != 1:
+            raise ToolError(f"시퀀스 불러오기로 생긴 레이어를 찾지 못했습니다 (새 레이어 {len(created)}개).")
+        layer = created[0]
+        layer.refresh()
+        frames = layer.end - layer.start + 1
+        if frames != len(images):
+            raise ToolError(f"시퀀스 불러오기 결과가 다릅니다 (요청 {len(images)}장, 결과 {frames}프레임).")
+        return layer.id
+
+    def replace_layer_frames(self, ref: LayerRef, images: list[Path], work: Path) -> int:
+        """원본 레이어를 '남길 그림만 1장씩' 들어간 새 레이어로 교체한다.
+
+        TVPaint 의 잘라내기/삭제는 환경설정(빈 칸 유지 등)에 따라 프레임을 지우지 않고 내용만 비우는 경우가 있어,
+        삭제 대신 새 레이어를 만들어 같은 이름·위치·설정으로 바꿔 끼운다. 전체가 하나의 실행취소 묶음 안에서 실행된다.
+        """
+        old = self._layer(ref)
+        clip = old.clip
+        old.refresh()
+        props = {
+            "name": old.name,
+            "start": old.start,
+            "position": old.position,
+            "opacity": old.opacity,
+            "blending_mode": old.blending_mode,
+            "pre_behavior": old.pre_behavior,
+            "post_behavior": old.post_behavior,
+            "is_visible": old.is_visible,
+        }
+        color_index = None
+        with contextlib.suppress(Exception):
+            color_index = george.tv_layer_color_get(old.id)
+
+        clip.current_frame = props["start"]
+        new_id = self._load_images_as_layer(clip, images, work, "clean")
+        new = Layer(layer_id=new_id, clip=clip)
+
+        george.tv_layer_kill(old.id)
+        george.tv_layer_rename(new_id, props["name"])
+        new.refresh()
+        if new.start != props["start"]:
+            new.shift(props["start"])
+        for attr in ("opacity", "blending_mode", "pre_behavior", "post_behavior", "is_visible"):
+            with contextlib.suppress(Exception):
+                setattr(new, attr, props[attr])
+        if color_index is not None:
+            with contextlib.suppress(Exception):
+                george.tv_layer_color_set(new_id, color_index)
+        with contextlib.suppress(Exception):
+            new.position = props["position"]
+        new.make_current()
+        self._layer_cache = {new_id: new}
+
+        new.refresh()
+        return new.end - new.start + 1
 
     # ---------- 크롭 프로젝트 ----------
-    def build_cropped_project(self, spec: CropSpec) -> str:
+    def build_cropped_project(self, spec: CropSpec, work: Path) -> str:
         src_layer = self._layer(spec.source)
         src_project = src_layer.project
         src_start = src_layer.start
@@ -319,10 +365,12 @@ class TVPaintBackend:
         par = src_project.pixel_aspect_ratio
         field = src_project.field_order
         start_frame = src_project.start_frame
-        opacity = src_layer.opacity
-        blending = src_layer.blending_mode
-        pre_behavior = src_layer.pre_behavior
-        post_behavior = src_layer.post_behavior
+        props = {
+            "opacity": src_layer.opacity,
+            "blending_mode": src_layer.blending_mode,
+            "pre_behavior": src_layer.pre_behavior,
+            "post_behavior": src_layer.post_behavior,
+        }
 
         new_path = self._crop_project_path(src_project, spec.source.name)
         src_id = george.tv_project_current_id()
@@ -331,58 +379,47 @@ class TVPaintBackend:
             project = Project.new(new_path, spec.width, spec.height, par, fps, field, start_frame)
             project.make_current()
             clip = project.current_clip
-            defaults = list(clip.layers)
+            defaults = [lyr.id for lyr in clip.layers]
 
-            layer = Layer.new_anim_layer(spec.source.name, clip)
-            for lyr in defaults:
-                if lyr.id != layer.id:
-                    george.tv_layer_kill(lyr.id)
+            clip.current_frame = start_frame
+            layer_id = self._load_images_as_layer(clip, spec.images, work, "crop")
+            for lid in defaults:
+                if lid != layer_id:
+                    with contextlib.suppress(Exception):
+                        george.tv_layer_kill(lid)
+            george.tv_layer_rename(layer_id, spec.source.name)
+            layer = Layer(layer_id=layer_id, clip=clip)
             layer.make_current()
+            layer.refresh()
 
+            # 콤마 복원: 뒤에서부터 늘려야 앞 그림 위치가 밀리지 않는다
             base = layer.start
-            clip.current_frame = base
-            for n, png in enumerate(spec.images):
-                if n > 0:
-                    george.tv_layer_insert_image(count=1, direction=george.InsertDirection.AFTER)
-                george.tv_load_image(png)
-
-            # 콤마 복원: 뒤에서부터 늘려야 앞 인스턴스 위치가 밀리지 않는다
             for n in reversed(range(len(spec.instances))):
                 length = spec.instances[n].length
                 if length > 1:
-                    LayerInstance(layer, base + n).length = length
+                    george.tv_exposure_set(base + n - start_frame, length)
 
-            if src_start != layer.start:
+            layer.refresh()
+            if layer.start != src_start:
                 layer.shift(src_start)
-
-            for attr, value in (
-                ("opacity", opacity),
-                ("blending_mode", blending),
-                ("pre_behavior", pre_behavior),
-                ("post_behavior", post_behavior),
-            ):
+            for attr, value in props.items():
                 with contextlib.suppress(Exception):
                     setattr(layer, attr, value)
+            clip.current_frame = src_start
 
-            clip.current_frame = layer.start
-
-            # 구조 검증
-            built = self.instances(
-                LayerRef(layer.id, layer.name, True, False, clip.name, project.name)
-            )
-            expected = [i.length for i in spec.instances]
-            actual = [i.length for i in built]
+            layer.refresh()
+            expected = sum(i.length for i in spec.instances)
+            actual = layer.end - layer.start + 1
             if expected != actual:
                 raise ToolError(
-                    "새 프로젝트의 콤마 구조가 원본과 다릅니다.\n"
-                    f"원본 {len(expected)}개 / 결과 {len(actual)}개 인스턴스.\n"
+                    "새 프로젝트의 프레임 수가 원본과 다릅니다.\n"
+                    f"원본 {expected}프레임 / 결과 {actual}프레임.\n"
                     "새 프로젝트는 열린 채로 두었으니 확인해 주세요. 원본은 변경되지 않았습니다."
                 )
             return project.name
         except ToolError:
-            raise  # 구조 검증 실패: 확인할 수 있도록 새 프로젝트를 열어 둔다
+            raise
         except Exception:
-            # 생성 도중 실패하면 반쯤 만들어진 빈 프로젝트가 남지 않도록 닫고 원본으로 돌아간다
             with contextlib.suppress(Exception):
                 current = george.tv_project_current_id()
                 if current != src_id:
