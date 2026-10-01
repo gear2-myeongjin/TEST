@@ -62,20 +62,17 @@ class TVPaintBackend:
 
     # pytvpaint 의 Layer.opacity 는 '현재 레이어'의 값을 읽는 명령을 써서, 다른 레이어가 현재일 때 엉뚱한 값을
     # 돌려줄 수 있다. 불투명도는 레이어 id 로 정보를 읽고, 쓸 때는 그 레이어를 현재로 만든 뒤 쓴다.
-    def _read_opacity_both(self, layer_id: int) -> tuple[int | None, int | None]:
-        """레이어 정보(tv_LayerInfo)와 현재 레이어 지정 후 읽기(tv_LayerDensity), 두 방법으로 읽는다."""
-        info = get = None
+    # 주의: 불투명도는 절대 tv_LayerDensity 를 '값 없이' 호출해서 읽지 않는다.
+    # 이 TVPaint 에서는 값 없이 호출하면 현재 레이어 불투명도가 0 으로 바뀐다 (Crop 0% 문제의 원인).
+    # 읽기는 레이어 정보(tv_LayerInfo)로만 한다.
+    def _read_opacity(self, layer_id: int) -> int | None:
         with contextlib.suppress(Exception):
-            info = int(george.tv_layer_info(layer_id).density)
-        with contextlib.suppress(Exception):
-            george.tv_layer_set(layer_id)
-            get = int(george.tv_layer_density_get())
-        return info, get
+            return int(george.tv_layer_info(layer_id).density)
+        return None
 
     def _get_opacity(self, layer_id: int) -> int:
-        info, get = self._read_opacity_both(layer_id)
-        self._trace(f"읽기 layer {layer_id}: info={info} density={get}")
-        value = info if info is not None else get
+        value = self._read_opacity(layer_id)
+        self._trace(f"읽기 layer {layer_id}: {value}")
         if value is None:
             raise ToolError("레이어 불투명도를 읽지 못했습니다.")
         return value
@@ -84,7 +81,7 @@ class TVPaintBackend:
         value = max(0, min(100, int(value)))
         george.tv_layer_set(layer_id)
         george.tv_layer_density_set(value)
-        self._trace(f"쓰기 layer {layer_id}: {value} -> 확인 {self._read_opacity_both(layer_id)}")
+        self._trace(f"쓰기 layer {layer_id}: {value} -> 확인 {self._read_opacity(layer_id)}")
 
     def read_layer_opacity(self, ref: LayerRef) -> int | None:
         self.opacity_trace = []
@@ -498,14 +495,14 @@ class TVPaintBackend:
         for pid, lid, label in ((src_pid, src_lid, "원본"), (new_pid, new_lid, "Crop")):
             with contextlib.suppress(Exception):
                 george.tv_project_select(pid)
-            info, get = self._read_opacity_both(lid)
-            self._trace(f"{label} 확인 전: info={info} density={get} (기대 {expected})")
-            if info != expected or get != expected:
+            value = self._read_opacity(lid)
+            self._trace(f"{label} 확인 전: {value} (기대 {expected})")
+            if value != expected:
                 with contextlib.suppress(Exception):
                     self._set_opacity(lid, expected)
-                info, get = self._read_opacity_both(lid)
-                if info != expected or get != expected:
-                    problems.append(f"{label} 레이어: 기대 {expected}%, 실제 info={info} density={get}")
+                value = self._read_opacity(lid)
+                if value != expected:
+                    problems.append(f"{label} 레이어: 기대 {expected}%, 실제 {value}%")
         with contextlib.suppress(Exception):
             george.tv_project_select(new_pid)
             george.tv_layer_set(new_lid)
