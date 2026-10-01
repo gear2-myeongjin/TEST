@@ -12,7 +12,6 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tvp_autotools.core import Instance  # noqa: E402
 from tvp_autotools.ops import CropSpec, LayerRef, ToolError, run_compact, run_crop  # noqa: E402
 
 W, H = 64, 48
@@ -31,66 +30,53 @@ def drawing(x, y, color=(255, 0, 0, 255), size=4):
 
 
 class FakeTVP:
+    """TVPaint 레이어 흉내: frames 는 (이미지, 콤마 길이) 목록, 내부적으로 프레임마다 이미지를 펼쳐 둔다."""
+
     def __init__(self, frames, start=1, name="Fire_Effect_01"):
-        self.frames = [[img, length] for img, length in frames]
+        self.per_frame = [img for img, length in frames for _ in range(length)]
         self.start = start
         self.ref = LayerRef(7, name, True, False, "Clip 1", "scene")
         self.undo_open = 0
         self.undo_closed = 0
-        self.fail_on_delete_n: int | None = None
-        self.deletes = 0
+        self.fail_replace = False
         self.built: CropSpec | None = None
         self.snapshot = None
 
     def current_layer(self):
         return self.ref
 
-    def _starts(self):
-        s, out = self.start, []
-        for _img, length in self.frames:
-            out.append(s)
-            s += length
-        return out
+    def layer_range(self, layer):
+        return self.start, self.start + len(self.per_frame) - 1
 
-    def instances(self, layer):
-        return [Instance(s, f[1]) for s, f in zip(self._starts(), self.frames)]
-
-    def render_instances(self, layer, starts, out_dir):
+    def render_frames(self, layer, frames, out_dir):
         result = {}
-        for s, (img, _l) in zip(self._starts(), self.frames):
-            if s in starts:
-                p = out_dir / f"inst.{s:04d}.png"
+        for i, img in enumerate(self.per_frame):
+            f = self.start + i
+            if f in frames:
+                p = out_dir / f"f.{f:05d}.png"
                 img.save(p)
-                result[s] = p
+                result[f] = p
         return result
 
     @contextlib.contextmanager
     def undo_group(self, name):
         self.undo_open += 1
-        self.snapshot = [list(f) for f in self.frames]
+        self.snapshot = list(self.per_frame)
         try:
             yield
         finally:
             self.undo_closed += 1
 
     def undo(self):
-        self.frames = self.snapshot
+        self.per_frame = self.snapshot
 
-    def _index(self, start):
-        return self._starts().index(start)
-
-    def delete_instance(self, layer, start, length):
-        self.deletes += 1
-        if self.fail_on_delete_n == self.deletes:
+    def replace_layer_frames(self, layer, images, work):
+        if self.fail_replace:
             raise RuntimeError("simulated failure")
-        i = self._index(start)
-        assert self.frames[i][1] == length
-        del self.frames[i]
+        self.per_frame = [Image.open(p).copy() for p in images]
+        return len(self.per_frame)
 
-    def set_instance_length(self, layer, start, length):
-        self.frames[self._index(start)][1] = length
-
-    def build_cropped_project(self, spec):
+    def build_cropped_project(self, spec, work):
         self.built = spec
         self.built_images = [Image.open(p).copy() for p in spec.images]
         return "scene_Fire_Effect_01_crop"
@@ -106,55 +92,68 @@ B = drawing(20, 10, (0, 255, 0, 255))
 C = drawing(40, 30, (0, 0, 255, 255))
 
 
-def lengths(tvp):
-    return [f[1] for f in tvp.frames]
+def same(im1, im2):
+    return im1.tobytes() == im2.tobytes()
+
+
+def result_is(tvp, expected):
+    assert len(tvp.per_frame) == len(expected)
+    assert all(same(a, b) for a, b in zip(tvp.per_frame, expected))
 
 
 def test_spec_example_A_A_blank_B_blank_C():
     # A A - - B B B - C C  (첫 A는 콤마 2, 두 번째 A는 복사본)
-    tvp = FakeTVP([(A, 1), (A_copy, 1), (blank(), 2), (B, 3), (blank(), 1), (C, 2)])
+    tvp = FakeTVP([(A, 2), (A_copy, 1), (blank(), 2), (B, 3), (blank(), 1), (C, 2)])
     msg = run_compact(tvp, 7, noop)
-    assert len(tvp.frames) == 3
-    assert lengths(tvp) == [1, 1, 1]
-    assert [f[0] for f in tvp.frames] == [A, B, C]
+    result_is(tvp, [A, B, C])
     assert tvp.undo_open == tvp.undo_closed == 1
-    assert "3장" in msg
+    assert "3장" in msg and "빈 프레임 3개" in msg
+
+
+def test_empty_frames_are_removed():
+    tvp = FakeTVP([(blank(), 1), (A, 1), (blank(), 4), (B, 1), (blank(), 2)])
+    run_compact(tvp, 7, noop)
+    result_is(tvp, [A, B])
+
+
+def test_consecutive_copies_removed_not_cleared():
+    tvp = FakeTVP([(A, 1), (A_copy, 1), (A_copy, 1), (B, 1)])
+    run_compact(tvp, 7, noop)
+    result_is(tvp, [A, B])  # 프레임 자체가 사라져야 하고 빈 칸이 남으면 안 된다
 
 
 def test_undo_restores_everything():
-    original = [(A, 2), (blank(), 2), (B, 3)]
-    tvp = FakeTVP(original)
+    tvp = FakeTVP([(A, 2), (blank(), 2), (B, 3)])
     run_compact(tvp, 7, noop)
     tvp.undo()
-    assert lengths(tvp) == [2, 2, 3]
+    assert len(tvp.per_frame) == 7
 
 
 def test_white_background_is_not_empty():
     white = Image.new("RGBA", (W, H), (255, 255, 255, 255))
     tvp = FakeTVP([(A, 1), (white, 2), (B, 1)])
     run_compact(tvp, 7, noop)
-    assert len(tvp.frames) == 3
-    assert lengths(tvp) == [1, 1, 1]
+    result_is(tvp, [A, white, B])
 
 
 def test_A_B_A_keeps_all():
     tvp = FakeTVP([(A, 2), (B, 2), (A_copy, 2)])
     run_compact(tvp, 7, noop)
-    assert len(tvp.frames) == 3
+    result_is(tvp, [A, B, A])
 
 
 def test_A_blank_A_merges():
     tvp = FakeTVP([(A, 1), (blank(), 1), (A_copy, 1), (B, 1)])
     run_compact(tvp, 7, noop)
-    assert [f[0] for f in tvp.frames] == [A, B]
+    result_is(tvp, [A, B])
 
 
 def test_invisible_pixel_rgb_ignored():
     ghost = drawing(5, 5)
-    ghost.putpixel((50, 40), (123, 45, 67, 0))  # 알파 0 인데 RGB 값만 다른 픽셀
+    ghost.putpixel((50, 40), (123, 45, 67, 0))
     tvp = FakeTVP([(A, 1), (ghost, 1)])
     run_compact(tvp, 7, noop)
-    assert len(tvp.frames) == 1
+    assert len(tvp.per_frame) == 1
 
 
 def test_one_pixel_difference_is_different_drawing():
@@ -162,14 +161,14 @@ def test_one_pixel_difference_is_different_drawing():
     near.putpixel((5, 5), (254, 0, 0, 255))
     tvp = FakeTVP([(A, 1), (near, 1)])
     run_compact(tvp, 7, noop)
-    assert len(tvp.frames) == 2
+    assert len(tvp.per_frame) == 2
 
 
 def test_all_empty_refuses():
     tvp = FakeTVP([(blank(), 3), (blank(), 1)])
     with pytest.raises(ToolError):
         run_compact(tvp, 7, noop)
-    assert lengths(tvp) == [3, 1]
+    assert len(tvp.per_frame) == 4
     assert tvp.undo_open == 0
 
 
@@ -194,8 +193,8 @@ def test_locked_layer_refused():
 
 
 def test_undo_stack_closed_on_failure():
-    tvp = FakeTVP([(A, 1), (blank(), 1), (B, 1), (blank(), 1)])
-    tvp.fail_on_delete_n = 2
+    tvp = FakeTVP([(A, 1), (blank(), 1), (B, 1)])
+    tvp.fail_replace = True
     with pytest.raises(RuntimeError):
         run_compact(tvp, 7, noop)
     assert tvp.undo_open == tvp.undo_closed == 1
@@ -204,25 +203,29 @@ def test_undo_stack_closed_on_failure():
 def test_layer_not_starting_at_1():
     tvp = FakeTVP([(A, 2), (blank(), 1), (B, 2)], start=25)
     run_compact(tvp, 7, noop)
-    assert lengths(tvp) == [1, 1]
+    result_is(tvp, [A, B])
 
 
 def test_crop_union_bbox_and_structure():
     tvp = FakeTVP([(A, 2), (blank(), 1), (B, 3), (C, 1)], start=10)
     msg = run_crop(tvp, 7, noop)
     spec = tvp.built
-    # A: (5,5)-(9,9), B: (20,10)-(24,14), C: (40,30)-(44,34) -> union (5,5)-(44,34)
     assert spec.offset == (5, 5)
     assert (spec.width, spec.height) == (39, 29)
-    assert [i.length for i in spec.instances] == [2, 1, 3, 1]
-    assert spec.instances[0].start == 10
+    assert [(i.start, i.length) for i in spec.instances] == [(10, 2), (12, 1), (13, 3), (16, 1)]
     assert all(im.size == (39, 29) for im in tvp.built_images)
-    # 위치 보정 확인: A 는 크롭 이미지 좌상단(0,0), C 는 우하단에 붙어야 한다
     assert tvp.built_images[0].getpixel((0, 0)) == (255, 0, 0, 255)
     assert tvp.built_images[3].getpixel((38, 28)) == (0, 0, 255, 255)
-    assert tvp.built_images[1].getchannel("A").getbbox() is None  # 빈 프레임 유지
-    assert lengths(tvp) == [2, 1, 3, 1]  # 원본 불변
+    assert tvp.built_images[1].getchannel("A").getbbox() is None  # 빈 프레임 구간 유지
+    assert len(tvp.per_frame) == 7  # 원본 불변
     assert "39×29" in msg
+
+
+def test_crop_keeps_empty_gaps_instead_of_holding_previous_drawing():
+    # 빈 프레임이 앞 그림의 콤마로 흡수되면 안 된다
+    tvp = FakeTVP([(A, 1), (blank(), 3), (B, 1)])
+    run_crop(tvp, 7, noop)
+    assert [i.length for i in tvp.built.instances] == [1, 3, 1]
 
 
 def test_crop_all_empty_refuses():
@@ -236,3 +239,18 @@ def test_non_anim_layer_refused():
     tvp.ref = LayerRef(7, "BG", False, False, "c", "p")
     with pytest.raises(ToolError, match="애니메이션 레이어가 아닙니다"):
         run_crop(tvp, 7, noop)
+
+
+def test_worker_delivers_results_to_matching_callbacks():
+    import time
+
+    from tvp_autotools.worker import Worker
+
+    w = Worker()
+    got = []
+    w.submit(lambda: "poll", lambda v: got.append(("poll", v)), lambda e, t: got.append(("poll_err", e)))
+    w.submit(lambda: "run", lambda v: got.append(("run", v)), lambda e, t: got.append(("run_err", e)))
+    time.sleep(0.3)
+    while not w.results.empty():
+        w.results.get_nowait()()
+    assert got == [("poll", "poll"), ("run", "run")]
