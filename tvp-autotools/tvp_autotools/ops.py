@@ -14,13 +14,16 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from tvp_autotools.core import (
+    MODE_CANCEL,
+    AtlasLayout,
+    AtlasOutput,
+    FramePlan,
     Instance,
     analyze_image,
-    crop_image,
-    AtlasLayout,
-    choose_atlas_layout,
     compose_atlas,
+    crop_image,
     group_runs,
+    plan_atlas_output,
     plan_frames,
     union_bbox,
 )
@@ -132,32 +135,68 @@ def _method_note(backend: Backend) -> str:
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
-def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progress) -> str:
+def _check_unchanged(backend: Backend, layer: LayerRef, frame_range: tuple[int, int]) -> None:
+    """Preview 이후 레이어가 바뀌었거나 프레임 범위가 달라졌으면 거부한다."""
+    current = backend.current_layer()
+    _check_layer(current, layer.id)
+    if tuple(backend.layer_range(current)) != tuple(frame_range):
+        raise ToolError(
+            "확인창을 띄운 뒤 레이어의 프레임 구성이 바뀌었습니다.\n"
+            "분석 결과가 맞지 않으므로 진행하지 않았습니다. 다시 실행해 주세요."
+        )
+
+
+# ---------------- 불필요 프레임 삭제 (Preview → 적용) ----------------
+
+
+@dataclass
+class CleanPlan:
+    """분석 결과. Preview 에 보여준 이 결과를 그대로 적용한다 (Preview 와 실제 결과가 같도록)."""
+
+    layer: LayerRef
+    frame_range: tuple[int, int]
+    plan: FramePlan
+    files: dict[int, Path]
+    work: Path
+
+    def discard(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+
+
+def analyze_compact(backend: Backend, expected_layer_id: int | None, progress: Progress) -> CleanPlan:
     with contextlib.suppress(Exception):
         backend.operation_label = "불필요 프레임 삭제"
     layer = backend.current_layer()
     _check_layer(layer, expected_layer_id)
     if layer.is_locked:
         raise ToolError(f"'{layer.name}' 레이어가 잠겨 있습니다. 잠금을 풀고 다시 실행해 주세요.")
-
     work = _make_workdir()
     try:
         frames, files, infos = _render_and_analyze(backend, layer, work, progress)
         plan = plan_frames(frames, infos)
         if not plan.keep:
             raise ToolError("레이어 전체가 빈 프레임입니다. 삭제하지 않았습니다.")
+        progress("분석 완료", 1.0)
+        return CleanPlan(layer, (frames[0], frames[-1]), plan, files, work)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+
+
+def apply_compact(backend: Backend, clean: CleanPlan, progress: Progress) -> str:
+    try:
+        layer, plan = clean.layer, clean.plan
         if plan.is_noop:
             progress("완료", 1.0)
             return f"'{layer.name}': 정리할 프레임이 없습니다. (이미 {len(plan.keep)}장 1콤마)" + _method_note(backend)
-
-        progress("레이어 다시 구성 중", 0.75)
+        _check_unchanged(backend, layer, clean.frame_range)
+        progress("레이어 다시 구성 중", 0.5)
         with backend.undo_group("TvpAAM_CleanFrames"):
-            result_count = backend.replace_layer_frames(layer, [files[f] for f in plan.keep], work)
-
+            result_count = backend.replace_layer_frames(layer, [clean.files[f] for f in plan.keep], clean.work)
         lines = [
             f"'{layer.name}' 정리 완료",
             f"프레임 {plan.total}개 → {len(plan.keep)}장 (1콤마)",
-            f"빈 프레임 {plan.removed_empty}개, 반복 그림(콤마·복사본) {plan.removed_repeat}개 정리",
+            f"빈 프레임 {plan.removed_empty}개, 중복 프레임 {plan.removed_repeat}개 제거",
             "TVPaint에서 실행취소(Ctrl+Z) 한 번으로 되돌릴 수 있습니다.",
         ]
         if result_count != len(plan.keep):
@@ -168,10 +207,31 @@ def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progr
         progress("완료", 1.0)
         return "\n".join(lines) + _method_note(backend)
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        clean.discard()
 
 
-def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress) -> str:
+def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progress) -> str:
+    """분석 + 적용을 한 번에 (테스트·내부용)."""
+    return apply_compact(backend, analyze_compact(backend, expected_layer_id, progress), progress)
+
+
+# ---------------- Crop (Preview → 생성) ----------------
+
+
+@dataclass
+class CropPlan:
+    layer: LayerRef
+    frame_range: tuple[int, int]
+    canvas: tuple[int, int] | None
+    spec: CropSpec
+    frames: int
+    work: Path
+
+    def discard(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+
+
+def analyze_crop(backend: Backend, expected_layer_id: int | None, progress: Progress) -> CropPlan:
     with contextlib.suppress(Exception):
         backend.operation_label = "Crop"
     layer = backend.current_layer()
@@ -188,10 +248,15 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
         bbox = union_bbox([i.bbox for i in infos])
         if bbox is None:
             raise ToolError("레이어 전체가 빈 프레임이라 크롭할 영역이 없습니다.")
+        canvas = None
+        with contextlib.suppress(Exception):
+            from PIL import Image
 
+            with Image.open(files[frames[0]]) as im:
+                canvas = im.size  # 렌더 결과는 캔버스 크기와 같다
         # 같은 그림이 이어지는 구간은 한 장 + 콤마로 되살린다 (빈 프레임 구간도 그대로 유지)
         runs = group_runs(frames, infos)
-        progress("크롭 이미지 만드는 중", 0.7)
+        progress("크롭 이미지 만드는 중", 0.8)
         cropped_dir = work / "cropped"
         cropped_dir.mkdir()
         cropped: list[Path] = []
@@ -199,7 +264,6 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
             dst = cropped_dir / f"crop_{n:05d}.png"
             crop_image(files[start], dst, bbox)
             cropped.append(dst)
-
         left, top, right, bottom = bbox
         spec = CropSpec(
             source=layer,
@@ -210,35 +274,61 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
             images=cropped,
             source_opacity=source_opacity,
         )
-        progress("새 프로젝트 생성 중", 0.82)
-        project_name = backend.build_cropped_project(spec, work)
+        progress("분석 완료", 1.0)
+        return CropPlan(layer, (frames[0], frames[-1]), canvas, spec, len(frames), work)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+
+
+def build_crop(backend: Backend, crop: CropPlan, progress: Progress) -> str:
+    try:
+        _check_unchanged(backend, crop.layer, crop.frame_range)
+        spec = crop.spec
+        progress("새 프로젝트 생성 중", 0.4)
+        project_name = backend.build_cropped_project(spec, crop.work)
         progress("완료", 1.0)
         check = getattr(backend, "opacity_check", None)
         warning = f"\n\n⚠ 불투명도 확인 실패 (이 내용을 그대로 전달해 주세요)\n{check}" if check else ""
+        left, top = spec.offset
         return (
-            f"'{layer.name}' 크롭 완료\n"
+            f"'{crop.layer.name}' 크롭 완료\n"
             f"새 프로젝트: {project_name}\n"
             f"크기 {spec.width}×{spec.height} (원본 캔버스 기준 X {left}, Y {top})\n"
-            f"프레임 {len(frames)}개, 그림 {len(runs)}장 + 콤마 구조 유지, 원본 프로젝트는 변경되지 않았습니다.\n"
+            f"프레임 {crop.frames}개, 그림 {len(spec.images)}장 + 콤마 구조 유지, 원본 프로젝트는 변경되지 않았습니다.\n"
             "새 프로젝트는 아직 저장되지 않았습니다."
             + _method_note(backend)
             + warning
         )
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        crop.discard()
 
 
-# ---------------- Atlas ----------------
+def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress) -> str:
+    """분석 + 생성을 한 번에 (테스트·내부용)."""
+    return build_crop(backend, analyze_crop(backend, expected_layer_id, progress), progress)
+
+
+# ---------------- Atlas (분석 → 설정/Preview → 생성) ----------------
 
 
 @dataclass
 class AtlasPlan:
-    """분석 결과. 확인창에 보여준 뒤 build_atlas 로 넘긴다 (임시 폴더는 build/discard 에서 지운다)."""
+    """분석 결과. 설정창에서 Padding/Max Size 를 정한 뒤 build_atlas 로 넘긴다."""
 
     layer: LayerRef
-    layout: AtlasLayout
+    frame_range: tuple[int, int]
+    cell_w: int
+    cell_h: int
     work: Path
     cells: list[Path]
+
+    @property
+    def count(self) -> int:
+        return len(self.cells)
+
+    def output(self, padding: int = 0, max_size: int = 0, mode: str = MODE_CANCEL) -> AtlasOutput:
+        return plan_atlas_output(self.count, self.cell_w, self.cell_h, padding, max_size, mode)
 
     def discard(self) -> None:
         shutil.rmtree(self.work, ignore_errors=True)
@@ -266,33 +356,46 @@ def analyze_atlas(backend: Backend, expected_layer_id: int | None, progress: Pro
             crop_image(files[frame], dst, bbox)  # 모든 프레임을 같은 bbox 로: 프레임 내부 좌표 보존
             cells.append(dst)
         left, top, right, bottom = bbox
-        layout = choose_atlas_layout(len(cells), right - left, bottom - top)
         progress("분석 완료", 1.0)
-        return AtlasPlan(layer=layer, layout=layout, work=work, cells=cells)
+        return AtlasPlan(layer, (frames[0], frames[-1]), right - left, bottom - top, work, cells)
     except BaseException:
         shutil.rmtree(work, ignore_errors=True)
         raise
 
 
-def build_atlas(backend: Backend, plan: AtlasPlan, progress: Progress) -> str:
+def build_atlas(backend: Backend, plan: AtlasPlan, progress: Progress, output: AtlasOutput | None = None) -> str:
     try:
-        current = backend.current_layer()
-        _check_layer(current, plan.layer.id)
+        out = output or plan.output()
+        if out.status == "too_big":
+            raise ToolError(
+                "Atlas 크기가 설정된 최대값을 초과합니다.\n\n"
+                f"예상 크기:\n{out.base.width} × {out.base.height}\n\n"
+                f"최대 크기:\n{out.max_size} × {out.max_size}\n\n"
+                "Atlas를 생성하지 않았습니다."
+            )
+        if out.status == "impossible":
+            raise ToolError(f"{out.reason}\n\nAtlas를 생성하지 않았습니다.")
+        _check_unchanged(backend, plan.layer, plan.frame_range)
         progress("Atlas 합성 중", 0.3)
         atlas_png = plan.work / "atlas.png"
-        compose_atlas(plan.cells, plan.layout, atlas_png)
+        compose_atlas(plan.cells, out.final, atlas_png)
         progress("새 프로젝트 생성 중", 0.6)
-        name = backend.build_atlas_project(plan.layer, atlas_png, plan.layout, plan.work)
+        name = backend.build_atlas_project(plan.layer, atlas_png, out.final, plan.work)
         progress("완료", 1.0)
-        L = plan.layout
-        return (
-            f"'{plan.layer.name}' Atlas 생성 완료\n"
-            f"새 프로젝트: {name}\n"
-            f"프레임 {L.count}개, 셀 {L.cell_w}×{L.cell_h}, {L.cols}열 × {L.rows}행\n"
-            f"Atlas {L.width}×{L.height}, 원본 프로젝트는 변경되지 않았습니다.\n"
-            "새 프로젝트는 아직 저장되지 않았습니다."
-            + _method_note(backend)
-        )
+        L = out.final
+        lines = [
+            f"'{plan.layer.name}' Atlas 생성 완료",
+            f"새 프로젝트: {name}",
+            f"프레임 {L.count}개, {L.cols}열 × {L.rows}행, Padding {L.padding}px",
+        ]
+        if out.scaled:
+            lines.append(
+                f"셀 {out.base.cell_w}×{out.base.cell_h} → {L.cell_w}×{L.cell_h} (축소 비율 {out.scale:.4f})"
+            )
+        else:
+            lines.append(f"셀 {L.cell_w}×{L.cell_h}")
+        lines.append(f"Atlas {L.width}×{L.height}, 원본 프로젝트는 변경되지 않았습니다.")
+        lines.append("새 프로젝트는 아직 저장되지 않았습니다.")
+        return "\n".join(lines) + _method_note(backend)
     finally:
         plan.discard()
-

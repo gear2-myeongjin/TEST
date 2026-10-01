@@ -228,13 +228,105 @@ def choose_atlas_layout(count: int, cell_w: int, cell_h: int, padding: int = 0) 
     return best
 
 
+# ---------------- Atlas 출력 크기 (Padding / Max Size) ----------------
+
+MODE_CANCEL = "cancel"  # 최대 크기 초과 시 생성하지 않음
+MODE_SCALE = "scale"  # 최대 크기에 맞춰 정비율 축소
+
+
+def parse_nonneg_int(text: str, label: str) -> int:
+    """공란은 0. 0 이상의 정수만 허용 (음수, 소수, 숫자가 아닌 입력은 거부)."""
+    t = (text or "").strip()
+    if t == "":
+        return 0
+    if not t.isdigit():
+        raise ValueError(f"{label}은(는) 0 이상의 정수로 입력해 주세요. (입력값: {t})")
+    return int(t)
+
+
+@dataclass(frozen=True)
+class AtlasOutput:
+    base: AtlasLayout  # 원래 셀 크기 + Padding 으로 고른 최적 배치
+    final: AtlasLayout  # 실제로 만들 결과 (축소가 없으면 base 와 같다)
+    max_size: int  # 0 이면 제한 없음
+    mode: str
+    scale: float  # 1.0 이면 축소 없음
+    status: str  # "ok" | "too_big" | "impossible"
+    reason: str = ""
+
+    @property
+    def scaled(self) -> bool:
+        return (self.final.cell_w, self.final.cell_h) != (self.base.cell_w, self.base.cell_h)
+
+
+def _with_cell(layout: AtlasLayout, cell_w: int, cell_h: int) -> AtlasLayout:
+    p = layout.padding
+    return AtlasLayout(
+        cols=layout.cols,
+        rows=layout.rows,
+        cell_w=cell_w,
+        cell_h=cell_h,
+        padding=p,
+        width=layout.cols * cell_w + (layout.cols - 1) * p,
+        height=layout.rows * cell_h + (layout.rows - 1) * p,
+        count=layout.count,
+    )
+
+
+def plan_atlas_output(count: int, cell_w: int, cell_h: int, padding: int, max_size: int, mode: str) -> AtlasOutput:
+    """배치는 항상 Padding 포함 정사각형 우선 규칙으로 먼저 고르고, Max Size 는 그 배치에만 적용한다.
+
+    Max Size 때문에 열/행을 바꾸지 않는다. 축소 모드에서도 Padding 은 줄이지 않는다.
+    """
+    base = choose_atlas_layout(count, cell_w, cell_h, padding)
+    if max_size <= 0 or (base.width <= max_size and base.height <= max_size):
+        return AtlasOutput(base, base, max_size, mode, 1.0, "ok")
+
+    over = f"예상 크기 {base.width} × {base.height}, 최대 크기 {max_size} × {max_size}"
+    if mode == MODE_CANCEL:
+        return AtlasOutput(base, base, max_size, mode, 1.0, "too_big", over)
+
+    available_w = max_size - (base.cols - 1) * padding
+    available_h = max_size - (base.rows - 1) * padding
+    if available_w <= 0 or available_h <= 0:
+        return AtlasOutput(base, base, max_size, mode, 0.0, "impossible", f"Padding이 너무 커서 이미지 영역이 남지 않습니다. ({over})")
+    scale = min(available_w / (base.cols * cell_w), available_h / (base.rows * cell_h), 1.0)
+    # 하나의 비율을 가로·세로에 똑같이 적용한 뒤 각각 정수로 반올림
+    sw = max(1, round(cell_w * scale))
+    sh = max(1, round(cell_h * scale))
+    final = _with_cell(base, sw, sh)
+    # 반올림 때문에 1px 넘치면 그 축만 1px 줄인다
+    while final.width > max_size and sw > 1:
+        sw -= 1
+        final = _with_cell(base, sw, sh)
+    while final.height > max_size and sh > 1:
+        sh -= 1
+        final = _with_cell(base, sw, sh)
+    if final.width > max_size or final.height > max_size or round(cell_w * scale) < 1 or round(cell_h * scale) < 1:
+        return AtlasOutput(base, final, max_size, mode, scale, "impossible", f"셀이 1px보다 작아져 축소할 수 없습니다. ({over})")
+    return AtlasOutput(base, final, max_size, mode, scale, "ok")
+
+
+def _resize_premultiplied(im: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """투명도를 고려한 Lanczos 축소. 미리 곱한 알파(RGBa)로 줄여야 가장자리에 어두운 테두리가 생기지 않는다."""
+    return im.convert("RGBa").resize(size, Image.LANCZOS).convert("RGBA")
+
+
 def compose_atlas(images: list[Path], layout: AtlasLayout, dst: Path) -> None:
-    """셀 크기와 정확히 같은 이미지들을 셀 좌상단에 1:1 로 붙인다. 빈 셀은 완전 투명."""
+    """셀 이미지들을 셀 좌상단에 붙인다. 빈 셀과 Padding 은 완전 투명.
+
+    셀 이미지가 layout 의 셀 크기와 같으면 1:1 로 그대로, 다르면(축소 모드) 셀마다 같은 크기로 줄여서 붙인다.
+    """
     atlas = Image.new("RGBA", (layout.width, layout.height), (0, 0, 0, 0))
+    first_size = None
     for index, path in enumerate(images):
         with Image.open(path) as src:
             im = src.convert("RGBA")
+        if first_size is None:
+            first_size = im.size
+        elif im.size != first_size:
+            raise ValueError(f"{index + 1}번째 프레임 크기 {im.size}가 다른 프레임과 다릅니다.")
         if im.size != (layout.cell_w, layout.cell_h):
-            raise ValueError(f"{index + 1}번째 프레임 크기 {im.size}가 셀 크기와 다릅니다.")
+            im = _resize_premultiplied(im, (layout.cell_w, layout.cell_h))
         atlas.paste(im, layout.cell_origin(index))  # 마스크 없이 붙여 알파까지 그대로 복사
     atlas.save(dst, format="PNG")

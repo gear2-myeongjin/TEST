@@ -8,14 +8,19 @@ from tkinter import filedialog
 from typing import Callable
 
 from tvp_autotools import installer
+from tvp_autotools.core import MODE_CANCEL, MODE_SCALE, parse_nonneg_int
 from tvp_autotools.ops import (
     AtlasPlan,
+    CleanPlan,
+    CropPlan,
     LayerRef,
     ToolError,
     analyze_atlas,
+    analyze_compact,
+    analyze_crop,
+    apply_compact,
     build_atlas,
-    run_compact,
-    run_crop,
+    build_crop,
 )
 from tvp_autotools.worker import Worker
 
@@ -335,43 +340,55 @@ class App:
 
     # ---------------- 실행 ----------------
     def _ask(self, which: str) -> None:
+        """세 기능 모두: 분석(원본 변경 없음) → Preview 확인창 → 그 분석 결과로 적용."""
         if self.running or not self.connected:
             return
 
         def got_layer(layer: LayerRef):
             self._show_layer(layer)
             if which == "atlas":
-                # Atlas 는 확인창에 셀/배치 정보를 보여줘야 하므로 분석을 먼저 한다 (원본은 바뀌지 않음)
                 self._start(lambda p: analyze_atlas(self.backend, layer.id, p), self._confirm_atlas, self.btn_atlas)
-                return
-            if which == "crop":
-                title = "Crop"
-                detail = "선택 레이어의 실제 그림 영역만큼 잘라 새 프로젝트를 만듭니다.\n원본 프로젝트는 바뀌지 않습니다."
-                fn = run_crop
-                button = self.btn_crop
+            elif which == "crop":
+                self._start(lambda p: analyze_crop(self.backend, layer.id, p), self._confirm_crop, self.btn_crop)
             else:
-                title = "불필요 프레임 삭제"
-                detail = "빈 프레임과 중복 그림을 지우고 전부 1콤마로 만듭니다.\nCtrl+Z 한 번으로 되돌릴 수 있습니다."
-                fn = run_compact
-                button = self.btn_clean
-            warnings = [NAME_WARNING] if which == "clean" and not layer.name.isascii() else []
-            question = "그래도 진행하시겠습니까?" if warnings else "정말 진행하시겠습니까?"
-            if ConfirmDialog(self.root, title, layer.name, detail, question=question, warnings=warnings).result:
-                self._start(lambda p: fn(self.backend, layer.id, p), self._show_summary, button)
+                self._start(lambda p: analyze_compact(self.backend, layer.id, p), self._confirm_clean, self.btn_clean)
 
         self.worker.submit(lambda: self.backend.current_layer(), got_layer, self._on_connect_failed)
 
-    def _confirm_atlas(self, plan: AtlasPlan) -> None:
-        L = plan.layout
-        detail = (
-            f"Frames: {L.count}\n"
-            f"Cell: {L.cell_w} × {L.cell_h}\n"
-            f"Layout: {L.cols}열 × {L.rows}행\n"
-            f"Atlas: {L.width} × {L.height}"
-        )
+    def _confirm_clean(self, clean: CleanPlan) -> None:
+        p = clean.plan
         self.message.config(text="", fg=C["text_dim"])
-        if ConfirmDialog(self.root, "Atlas 생성", plan.layer.name, detail, question="Atlas를 생성하시겠습니까?").result:
-            self._start(lambda p: build_atlas(self.backend, plan, p), self._show_summary, self.btn_atlas)
+        if p.is_noop:
+            clean.discard()
+            MessageDialog(self.root, "불필요 프레임 삭제", f"'{clean.layer.name}': 정리할 프레임이 없습니다. (이미 {len(p.keep)}장 1콤마)")
+            return
+        detail = (
+            f"{p.total} → {len(p.keep)} frames\n\n"
+            f"빈 프레임 제거: {p.removed_empty}\n"
+            f"중복 프레임 제거: {p.removed_repeat}\n\n"
+            "Ctrl+Z 한 번으로 되돌릴 수 있습니다."
+        )
+        warnings = [NAME_WARNING] if not clean.layer.name.isascii() else []
+        question = "그래도 진행하시겠습니까?" if warnings else "진행하시겠습니까?"
+        if ConfirmDialog(self.root, "불필요 프레임 삭제", clean.layer.name, detail, question=question, warnings=warnings).result:
+            self._start(lambda pr: apply_compact(self.backend, clean, pr), self._show_summary, self.btn_clean)
+        else:
+            clean.discard()
+
+    def _confirm_crop(self, crop: CropPlan) -> None:
+        self.message.config(text="", fg=C["text_dim"])
+        original = f"{crop.canvas[0]} × {crop.canvas[1]}" if crop.canvas else "?"
+        detail = f"Original:\n{original}\n\nCrop:\n{crop.spec.width} × {crop.spec.height}\n\n원본 프로젝트는 바뀌지 않습니다."
+        if ConfirmDialog(self.root, "Crop", crop.layer.name, detail, question="새 Crop 프로젝트를 생성하시겠습니까?").result:
+            self._start(lambda pr: build_crop(self.backend, crop, pr), self._show_summary, self.btn_crop)
+        else:
+            crop.discard()
+
+    def _confirm_atlas(self, plan: AtlasPlan) -> None:
+        self.message.config(text="", fg=C["text_dim"])
+        output = AtlasSettingsDialog(self.root, plan).output
+        if output is not None:
+            self._start(lambda pr: build_atlas(self.backend, plan, pr, output), self._show_summary, self.btn_atlas)
         else:
             plan.discard()
 
@@ -615,3 +632,112 @@ class HelpDialog(_Dialog):
         self.bind("<Escape>", lambda e: self.destroy())
         self._show()
 
+
+
+class AtlasSettingsDialog(_Dialog):
+    """Atlas 설정(Padding / Max Size / 모드)과 결과 Preview 를 한 창에. 입력을 바꾸면 바로 다시 계산한다."""
+
+    def __init__(self, master, plan: AtlasPlan):
+        super().__init__(master, "Atlas 생성")
+        self.plan = plan
+        self.output = None
+        self._current = None
+
+        tk.Label(self.body, text="현재 레이어:", fg=C["text_dim"], bg=C["window"], font=F_BODY).pack(anchor="w")
+        box = tk.Frame(self.body, bg=C["field"], padx=8, pady=6)
+        box.pack(fill="x", pady=(3, 10))
+        tk.Label(box, text=plan.layer.name, fg=C["text"], bg=C["field"], font=F_LAYER, anchor="w").pack(fill="x")
+
+        form = tk.Frame(self.body, bg=C["panel"], highlightthickness=1, highlightbackground=C["panel_edge"], padx=12, pady=10)
+        form.pack(fill="x")
+        self.pad_var = tk.StringVar(value="0")
+        self.max_var = tk.StringVar(value="")
+        self.mode_var = tk.StringVar(value=MODE_CANCEL)
+        self._entry(form, 0, "Padding (px)", self.pad_var, "기본 0, 공란은 0")
+        self._entry(form, 1, "Max Size (px)", self.max_var, "공란 또는 0은 제한 없음")
+        self.radios = []
+        for row, (value, text) in enumerate(((MODE_CANCEL, "최대 크기 초과 시 생성하지 않음"), (MODE_SCALE, "최대 크기에 맞춰 정비율 축소")), start=2):
+            rb = tk.Radiobutton(
+                form, text=text, variable=self.mode_var, value=value, command=self._update,
+                bg=C["panel"], fg=C["text"], selectcolor=C["field"], activebackground=C["panel"],
+                activeforeground=C["text"], disabledforeground=C["text_dim"], font=F_BODY, bd=0, highlightthickness=0,
+            )
+            rb.grid(row=row, column=0, columnspan=3, sticky="w", pady=(6 if row == 2 else 2, 0))
+            self.radios.append(rb)
+
+        self.preview = tk.Label(self.body, text="", fg=C["text"], bg=C["window"], font=F_BODY, justify="left", anchor="w")
+        self.preview.pack(fill="x", pady=(12, 0))
+        self.status = tk.Label(self.body, text="", fg=C["warn"], bg=C["window"], font=F_SMALL, justify="left", wraplength=400, anchor="w")
+        self.status.pack(fill="x", pady=(6, 0))
+        tk.Label(self.body, text=WORK_WARNING, fg=C["warn"], bg=C["window"], font=F_SMALL, justify="left", wraplength=400).pack(
+            anchor="w", pady=(8, 0)
+        )
+        tk.Label(self.body, text="진행하시겠습니까?", fg=C["text"], bg=C["window"], font=F_BODY).pack(anchor="w", pady=(10, 12))
+
+        row = tk.Frame(self.body, bg=C["window"])
+        row.pack(fill="x")
+        FlatButton(row, "취소", self._cancel, font=F_BODY, pady=4).pack(side="right")
+        self.ok_btn = FlatButton(row, "진행", self._ok, primary=True, font=F_BODY, pady=4)
+        self.ok_btn.pack(side="right", padx=(0, 6))
+        for var in (self.pad_var, self.max_var):
+            var.trace_add("write", lambda *_: self._update())
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self._update()
+        self._show()
+
+    def _entry(self, parent, row: int, label: str, var: tk.StringVar, hint: str) -> None:
+        tk.Label(parent, text=label, fg=C["text"], bg=C["panel"], font=F_BODY, width=14, anchor="w").grid(row=row, column=0, sticky="w", pady=2)
+        tk.Entry(
+            parent, textvariable=var, width=8, bg=C["field"], fg=C["text"], insertbackground=C["text"],
+            relief="flat", font=F_BODY, highlightthickness=1, highlightbackground=C["panel_edge"], highlightcolor=C["accent"],
+        ).grid(row=row, column=1, sticky="w", padx=(0, 8), pady=2, ipady=2)
+        tk.Label(parent, text=hint, fg=C["text_dim"], bg=C["panel"], font=F_SMALL).grid(row=row, column=2, sticky="w")
+
+    def _update(self) -> None:
+        self._current = None
+        try:
+            padding = parse_nonneg_int(self.pad_var.get(), "Padding")
+            max_size = parse_nonneg_int(self.max_var.get(), "Max Size")
+        except ValueError as exc:
+            self.preview.config(text="")
+            self.status.config(text=str(exc), fg=C["bad"])
+            self.ok_btn.set_enabled(False)
+            return
+        for rb in self.radios:
+            rb.config(state="normal" if max_size > 0 else "disabled")
+        mode = self.mode_var.get()
+        out = self.plan.output(padding, max_size, mode)
+        B, F = out.base, out.final
+        lines = [
+            f"Frames: {B.count}",
+            f"Cell: {B.cell_w} × {B.cell_h}",
+            f"Layout: {B.cols}열 × {B.rows}행",
+            f"Padding: {padding} px",
+            f"Atlas: {B.width} × {B.height}",
+            f"Max Size: {max_size if max_size else '제한 없음'}",
+        ]
+        if max_size:
+            lines.append(f"Mode: {'정비율 축소' if mode == MODE_SCALE else '초과 시 생성하지 않음'}")
+        if out.status == "ok" and out.scaled:
+            lines += [f"Final Cell: {F.cell_w} × {F.cell_h}", f"Final Atlas: {F.width} × {F.height}"]
+        self.preview.config(text="\n".join(lines))
+        if out.status == "too_big":
+            self.status.config(text=f"Atlas 크기가 최대값을 초과합니다. ({out.reason}) 진행하면 생성하지 않고 중단합니다.", fg=C["warn"])
+        elif out.status == "impossible":
+            self.status.config(text=out.reason, fg=C["bad"])
+        else:
+            self.status.config(text="")
+        self._current = out
+        self.ok_btn.set_enabled(True)
+
+    def _ok(self) -> None:
+        if self._current is None:
+            return
+        self.output = self._current
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.output = None
+        self.destroy()
