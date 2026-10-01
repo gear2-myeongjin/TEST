@@ -1,4 +1,4 @@
-name: Build TVPaintAutoCrop.exe
+name: Build TvpAAM.exe
 
 on:
   push:
@@ -34,7 +34,7 @@ jobs:
       - name: Build single EXE
         run: >
           pyinstaller --noconfirm --onefile --windowed
-          --name TVPaintAutoCrop
+          --name TvpAAM
           --icon assets/icon.ico
           --add-data "plugin/tvpaint-rpc.dll;plugin"
           --add-data "assets/icon.ico;assets"
@@ -43,5 +43,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: TVPaintAutoCrop
-          path: tvp-autotools/dist/TVPaintAutoCrop.exe
+          name: TvpAAM
+          path: tvp-autotools/dist/TvpAAM.exe
