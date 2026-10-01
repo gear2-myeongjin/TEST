@@ -12,7 +12,8 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tvp_autotools.ops import CropSpec, LayerRef, ToolError, run_compact, run_crop  # noqa: E402
+from tvp_autotools.core import choose_atlas_layout  # noqa: E402
+from tvp_autotools.ops import CropSpec, LayerRef, ToolError, analyze_atlas, build_atlas, run_compact, run_crop  # noqa: E402
 
 W, H = 64, 48
 
@@ -75,6 +76,11 @@ class FakeTVP:
             raise RuntimeError("simulated failure")
         self.per_frame = [Image.open(p).copy() for p in images]
         return len(self.per_frame)
+
+    def build_atlas_project(self, source, atlas_png, layout, work):
+        self.atlas = Image.open(atlas_png).copy()
+        self.atlas_layout = layout
+        return "Atlas_01"
 
     def build_cropped_project(self, spec, work):
         self.built = spec
@@ -254,3 +260,78 @@ def test_worker_delivers_results_to_matching_callbacks():
     while not w.results.empty():
         w.results.get_nowait()()
     assert got == [("poll", "poll"), ("run", "run")]
+
+
+# ---------------- Atlas ----------------
+
+
+def test_layout_square_by_pixels_not_count():
+    L = choose_atlas_layout(10, 128, 96)
+    assert (L.cols, L.rows, L.width, L.height) == (3, 4, 384, 384)
+
+
+def test_layout_tall_cells_prefer_wide_grid():
+    L = choose_atlas_layout(9, 64, 128)  # 3x3 보다 5x2 가 픽셀상 더 정사각형
+    assert (L.cols, L.rows) == (5, 2)
+
+
+def test_layout_tie_prefers_fewer_waste_then_area():
+    import math
+
+    # 동률 후보 중 빈 셀/면적 규칙이 적용되는지 전수 비교로 확인
+    for n in range(1, 40):
+        for cw, ch in [(10, 10), (30, 10), (10, 30), (7, 5)]:
+            L = choose_atlas_layout(n, cw, ch)
+            cands = []
+            for c in range(1, n + 1):
+                r = math.ceil(n / c)
+                w, h = c * cw, r * ch
+                cands.append((abs(math.log(w / h)), c * r - n, w * h, c))
+            best = min(cands, key=lambda t: (round(t[0], 9), t[1], t[2]))
+            assert (L.cols,) == (best[3],) or (
+                abs(cands[L.cols - 1][0] - best[0]) <= 1e-9 and cands[L.cols - 1][1:3] == best[1:3]
+            )
+
+
+def test_atlas_preserves_in_frame_coordinates_and_order():
+    tvp = FakeTVP([(A, 1), (B, 1), (C, 1), (blank(), 1), (A, 1)])
+    plan = analyze_atlas(tvp, 7, noop)
+    L = plan.layout
+    # union bbox (5,5)-(44,34) -> 셀 39x29, 프레임 5개
+    assert (L.cell_w, L.cell_h, L.count) == (39, 29, 5)
+    build_atlas(tvp, plan, noop)
+    atlas = tvp.atlas
+    assert atlas.size == (L.width, L.height)
+    frames = [A, B, C, blank(), A]
+    for i, src in enumerate(frames):
+        x, y = L.cell_origin(i)
+        cell = atlas.crop((x, y, x + L.cell_w, y + L.cell_h))
+        expected = src.crop((5, 5, 44, 34))  # 모든 프레임 공통 bbox: 내부 좌표 그대로
+        assert cell.tobytes() == expected.tobytes(), f"cell {i}"
+    # 남는 셀은 완전 투명
+    for i in range(L.count, L.cols * L.rows):
+        x, y = L.cell_origin(i)
+        assert atlas.crop((x, y, x + L.cell_w, y + L.cell_h)).getchannel("A").getbbox() is None
+    assert not plan.work.exists()  # 임시 폴더 정리
+    assert len(tvp.per_frame) == 5  # 원본 불변
+
+
+def test_atlas_order_left_to_right_top_to_bottom():
+    L = choose_atlas_layout(10, 10, 10)
+    assert [L.cell_origin(i) for i in range(5)] == [(0, 0), (10, 0), (20, 0), (30, 0), (0, 10)] or L.cols != 4
+    assert L.cell_origin(L.cols) == (0, 10)
+
+
+def test_atlas_layer_changed_between_confirm_and_build():
+    tvp = FakeTVP([(A, 1), (B, 1)])
+    plan = analyze_atlas(tvp, 7, noop)
+    tvp.ref = LayerRef(8, "other", True, False, "c", "p")
+    with pytest.raises(ToolError, match="바뀌었습니다"):
+        build_atlas(tvp, plan, noop)
+    assert not plan.work.exists()
+
+
+def test_atlas_all_empty_refuses():
+    tvp = FakeTVP([(blank(), 3)])
+    with pytest.raises(ToolError):
+        analyze_atlas(tvp, 7, noop)
