@@ -49,7 +49,7 @@ class CropSpec:
     offset: tuple[int, int]  # 원본 캔버스에서 잘라낸 영역의 좌상단
     instances: list[Instance]
     images: list[Path]  # 인스턴스 순서대로 크롭된 PNG
-    source_opacity: int | None = None  # 작업 시작 전에 읽어 둔 원본 레이어 불투명도
+    source_opacity: float | None = None  # 작업 시작 전에 읽어 둔 원본 레이어 불투명도 (TVPaint 단위)
 
 
 class Backend(Protocol):
@@ -278,19 +278,3 @@ def build_atlas(backend: Backend, plan: AtlasPlan, progress: Progress) -> str:
     finally:
         plan.discard()
 
-
-# ---------------- [임시] 불투명도 진단 ----------------
-
-
-def run_opacity_diagnosis(backend: Backend, expected_layer_id: int | None, progress: Progress) -> None:
-    """Crop/Atlas 분석과 똑같은 렌더링 단계만 실행한다 (새 프로젝트를 만들지 않고, 원본도 편집하지 않음)."""
-    layer = backend.current_layer()
-    _check_layer(layer, expected_layer_id)
-    work = _make_workdir()
-    try:
-        start, end = backend.layer_range(layer)
-        progress("진단: 렌더링 단계 실행 중", 0.3)
-        backend.render_frames(layer, list(range(start, end + 1)), work)
-        progress("진단 완료", 1.0)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
