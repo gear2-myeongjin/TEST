@@ -37,7 +37,7 @@ jobs:
           --name TvpAAM
           --icon assets/icon.ico
           --add-data "plugin/tvpaint-rpc.dll;plugin"
-          --add-data "assets/icon.ico;assets"
+          --add-data "assets;assets"
           --collect-submodules pytvpaint
           main.py
 
