@@ -12,8 +12,20 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tvp_autotools.core import choose_atlas_layout  # noqa: E402
-from tvp_autotools.ops import CropSpec, LayerRef, ToolError, analyze_atlas, build_atlas, run_compact, run_crop  # noqa: E402
+from tvp_autotools.core import MODE_CANCEL, MODE_SCALE, choose_atlas_layout, parse_nonneg_int, plan_atlas_output  # noqa: E402
+from tvp_autotools.ops import (  # noqa: E402
+    CropSpec,
+    LayerRef,
+    ToolError,
+    analyze_atlas,
+    analyze_compact,
+    analyze_crop,
+    apply_compact,
+    build_atlas,
+    build_crop,
+    run_compact,
+    run_crop,
+)
 
 W, H = 64, 48
 
@@ -296,7 +308,7 @@ def test_layout_tie_prefers_fewer_waste_then_area():
 def test_atlas_preserves_in_frame_coordinates_and_order():
     tvp = FakeTVP([(A, 1), (B, 1), (C, 1), (blank(), 1), (A, 1)])
     plan = analyze_atlas(tvp, 7, noop)
-    L = plan.layout
+    L = plan.output().final
     # union bbox (5,5)-(44,34) -> 셀 39x29, 프레임 5개
     assert (L.cell_w, L.cell_h, L.count) == (39, 29, 5)
     build_atlas(tvp, plan, noop)
@@ -335,3 +347,174 @@ def test_atlas_all_empty_refuses():
     tvp = FakeTVP([(blank(), 3)])
     with pytest.raises(ToolError):
         analyze_atlas(tvp, 7, noop)
+
+
+# ---------------- 사양서 13항: Preview / Padding / Max Size ----------------
+
+
+def test_clean_preview_matches_spec_example_and_actual_result():
+    # A A - B B B  ->  total 6, empty 1, duplicate 3, result 2
+    tvp = FakeTVP([(A, 1), (A_copy, 1), (blank(), 1), (B, 3)])
+    clean = analyze_compact(tvp, 7, noop)
+    p = clean.plan
+    assert (p.total, p.removed_empty, p.removed_repeat, len(p.keep)) == (6, 1, 3, 2)
+    assert len(tvp.per_frame) == 6 and tvp.undo_open == 0  # Preview 단계에서는 바꾸지 않는다
+    apply_compact(tvp, clean, noop)
+    assert len(tvp.per_frame) == len(p.keep)  # Preview 와 실제 결과가 같다
+    assert not clean.work.exists()
+
+
+def test_clean_refuses_if_layer_changed_after_preview():
+    tvp = FakeTVP([(A, 2), (B, 1)])
+    clean = analyze_compact(tvp, 7, noop)
+    tvp.ref = LayerRef(8, "other", True, False, "c", "p")
+    with pytest.raises(ToolError, match="바뀌었습니다"):
+        apply_compact(tvp, clean, noop)
+    assert len(tvp.per_frame) == 3
+
+
+def test_clean_refuses_if_frame_range_changed_after_preview():
+    tvp = FakeTVP([(A, 2), (B, 1)])
+    clean = analyze_compact(tvp, 7, noop)
+    tvp.per_frame.append(C)  # 확인창 뒤에 프레임이 추가됨
+    with pytest.raises(ToolError, match="프레임 구성이 바뀌었습니다"):
+        apply_compact(tvp, clean, noop)
+
+
+def test_crop_preview_size_equals_actual_crop():
+    tvp = FakeTVP([(A, 2), (blank(), 1), (B, 3), (C, 1)], start=10)
+    crop = analyze_crop(tvp, 7, noop)
+    preview = (crop.spec.width, crop.spec.height)
+    assert crop.canvas == (W, H)
+    assert len(tvp.per_frame) == 7  # Preview 단계에서는 바꾸지 않는다
+    build_crop(tvp, crop, noop)
+    assert (tvp.built.width, tvp.built.height) == preview == (39, 29)
+    assert all(im.size == preview for im in tvp.built_images)
+
+
+def test_padding_atlas_size_spec_example():
+    from tvp_autotools.core import _with_cell
+
+    base = choose_atlas_layout(12, 100, 100, 2)
+    L = _with_cell(type(base)(4, 3, 100, 100, 2, 0, 0, 12), 100, 100)
+    assert (L.width, L.height) == (406, 304)
+    assert L.cell_origin(1) == (102, 0) and L.cell_origin(4) == (0, 102)
+
+
+def test_padding_zero_keeps_previous_layout():
+    for n in range(1, 30):
+        for cw, ch in [(128, 96), (64, 128), (10, 10)]:
+            a = choose_atlas_layout(n, cw, ch)
+            b = plan_atlas_output(n, cw, ch, 0, 0, MODE_CANCEL).final
+            assert (a.cols, a.rows, a.width, a.height) == (b.cols, b.rows, b.width, b.height)
+
+
+def test_large_padding_reevaluates_layout_by_final_pixel_ratio():
+    import math
+
+    n, cw, ch, pad = 6, 10, 10, 50
+    L = choose_atlas_layout(n, cw, ch, pad)
+    best = min(
+        range(1, n + 1),
+        key=lambda c: (
+            round(abs(math.log((c * cw + (c - 1) * pad) / (math.ceil(n / c) * ch + (math.ceil(n / c) - 1) * pad))), 9),
+            c * math.ceil(n / c) - n,
+            (c * cw + (c - 1) * pad) * (math.ceil(n / c) * ch + (math.ceil(n / c) - 1) * pad),
+        ),
+    )
+    assert L.cols == best
+
+
+def test_max_size_cancel():
+    out = plan_atlas_output(2, 2048, 2048, 0, 2048, MODE_CANCEL)  # 4096 x 2048 가 되는 구성
+    assert (out.base.width, out.base.height) in ((4096, 2048), (2048, 4096))
+    assert out.status == "too_big"
+
+
+def test_max_size_cancel_stops_before_project_creation():
+    tvp = FakeTVP([(A, 1), (B, 1), (C, 1)])
+    plan = analyze_atlas(tvp, 7, noop)
+    out = plan.output(0, 10, MODE_CANCEL)
+    with pytest.raises(ToolError, match="초과합니다"):
+        build_atlas(tvp, plan, noop, out)
+    assert not hasattr(tvp, "atlas")  # 프로젝트를 만들지 않았다
+
+
+def test_scale_down_spec_example():
+    out = plan_atlas_output(16, 512, 512, 4, 2048, MODE_SCALE)
+    F = out.final
+    assert out.status == "ok" and (out.base.cols, out.base.rows) == (F.cols, F.rows) == (4, 4)
+    assert F.width <= 2048 and F.height <= 2048 and F.padding == 4
+
+
+def test_padding_fixed_after_scale_down():
+    out = plan_atlas_output(17, 428, 512, 4, 2048, MODE_SCALE)
+    F = out.final
+    for i in range(F.count - 1):
+        if (i + 1) % F.cols:
+            x0, x1 = F.cell_origin(i)[0], F.cell_origin(i + 1)[0]
+            assert x1 - (x0 + F.cell_w) == 4
+    assert F.cell_origin(F.cols)[1] - F.cell_h == 4
+
+
+def test_scale_down_same_factor_and_aspect():
+    for args in [(17, 428, 512, 4), (10, 128, 96, 0), (30, 300, 70, 8), (5, 999, 333, 2)]:
+        out = plan_atlas_output(*args, 1024, MODE_SCALE)
+        if out.status != "ok" or not out.scaled:
+            continue
+        F, B = out.final, out.base
+        assert F.width <= 1024 and F.height <= 1024 and out.scale <= 1.0
+        # 하나의 비율을 가로·세로에 적용 후 반올림 (보정 포함 1px 이내)
+        assert abs(F.cell_w - B.cell_w * out.scale) <= 1.0
+        assert abs(F.cell_h - B.cell_h * out.scale) <= 1.0
+
+
+def test_scale_never_enlarges():
+    out = plan_atlas_output(4, 10, 10, 0, 5000, MODE_SCALE)
+    assert out.final.cell_w == 10 and not out.scaled
+
+
+def test_scale_impossible_when_padding_eats_max():
+    out = plan_atlas_output(4, 10, 10, 3000, 100, MODE_SCALE)
+    assert out.status == "impossible"
+
+
+def test_scaled_atlas_keeps_relative_positions_and_padding_transparent():
+    tvp = FakeTVP([(A, 1), (B, 1), (C, 1), (A_copy, 1)])
+    plan = analyze_atlas(tvp, 7, noop)
+    out = plan.output(3, 60, MODE_SCALE)
+    assert out.status == "ok" and out.scaled
+    build_atlas(tvp, plan, noop, out)
+    atlas, F = tvp.atlas, out.final
+    assert atlas.size == (F.width, F.height)
+    # 셀 사이 Padding 은 완전 투명
+    x0, _ = F.cell_origin(0)
+    gap = atlas.crop((x0 + F.cell_w, 0, x0 + F.cell_w + 3, F.cell_h))
+    assert gap.getchannel("A").getbbox() is None
+    # 같은 그림(A, A_copy)은 축소 후에도 같은 셀 이미지
+    def cell(i):
+        x, y = F.cell_origin(i)
+        return atlas.crop((x, y, x + F.cell_w, y + F.cell_h)).tobytes()
+    assert cell(0) == cell(3)
+
+
+def test_input_validation():
+    assert parse_nonneg_int("", "Padding") == 0
+    assert parse_nonneg_int(" 4 ", "Padding") == 4
+    for bad in ["-1", "abc", "1.5", "-10"]:
+        with pytest.raises(ValueError):
+            parse_nonneg_int(bad, "Padding")
+
+
+def test_premultiplied_resize_has_no_dark_fringe():
+    from tvp_autotools.core import _resize_premultiplied
+
+    im = Image.new("RGBA", (40, 40), (0, 0, 0, 0))
+    for x in range(10, 30):
+        for y in range(10, 30):
+            im.putpixel((x, y), (255, 255, 255, 255))
+    small = _resize_premultiplied(im, (13, 13))
+    pix = small.load()
+    for px in (pix[x, y] for x in range(13) for y in range(13)):
+        if 0 < px[3] < 255:
+            assert px[0] > 200, px  # 반투명 가장자리도 흰색 유지 (검은 테두리 없음)
