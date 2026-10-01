@@ -20,7 +20,6 @@ from pytvpaint.george.client import rpc_client  # noqa: E402
 from pytvpaint.layer import Layer  # noqa: E402
 from pytvpaint.project import Project  # noqa: E402
 
-from tvp_autotools.core import safe_filename  # noqa: E402
 from tvp_autotools.ops import CropSpec, LayerRef, ToolError  # noqa: E402
 
 
@@ -58,6 +57,17 @@ class TVPaintBackend:
         """실시간 표시용 가벼운 조회 (RPC 2회). 바뀌었을 때만 current_layer() 로 전체 정보를 읽는다."""
         layer_id = george.tv_layer_current_id()
         return layer_id, george.tv_layer_info(layer_id).name
+
+    # pytvpaint 의 Layer.opacity 는 '현재 레이어'의 값을 읽는 명령을 써서, 다른 레이어가 현재일 때 엉뚱한 값을
+    # 돌려줄 수 있다. 불투명도는 레이어 id 로 정보를 읽고, 쓸 때는 그 레이어를 현재로 만든 뒤 쓴다.
+    @staticmethod
+    def _get_opacity(layer_id: int) -> int:
+        return int(george.tv_layer_info(layer_id).density)
+
+    @staticmethod
+    def _set_opacity(layer_id: int, value: int) -> None:
+        george.tv_layer_set(layer_id)
+        george.tv_layer_density_set(max(0, min(100, int(value))))
 
     def _layer(self, ref: LayerRef) -> Layer:
         layer = self._layer_cache.get(ref.id)
@@ -119,7 +129,7 @@ class TVPaintBackend:
                 return None
 
         visibility = [(lyr, safe(lambda l=lyr: l.is_visible)) for lyr in clip.layers]
-        opacity = safe(lambda: layer.opacity)
+        opacity = safe(lambda: self._get_opacity(layer.id))
         blending = safe(lambda: layer.blending_mode)
         background = safe(george.tv_background_get)
         alpha_save = safe(george.tv_alpha_save_mode_get)
@@ -135,7 +145,7 @@ class TVPaintBackend:
             if save_mode is not None:
                 steps.append(lambda: george.tv_save_mode_set(save_mode[0], *save_mode[1]))
             if opacity is not None:
-                steps.append(lambda: setattr(layer, "opacity", opacity))
+                steps.append(lambda: self._set_opacity(layer.id, opacity))
             if blending is not None:
                 steps.append(lambda: setattr(layer, "blending_mode", blending))
             for lyr, was_visible in visibility:
@@ -147,12 +157,17 @@ class TVPaintBackend:
             for step in steps:
                 with contextlib.suppress(Exception):
                     step()
+            # 불투명도는 되돌린 뒤 실제 값을 다시 읽어 확인하고, 다르면 한 번 더 맞춘다
+            if opacity is not None:
+                with contextlib.suppress(Exception):
+                    if self._get_opacity(layer.id) != opacity:
+                        self._set_opacity(layer.id, opacity)
+                        layer.make_current()
 
         return restore
 
-    @staticmethod
-    def _isolate_layer(layer: Layer, clip) -> None:
-        layer.opacity = 100
+    def _isolate_layer(self, layer: Layer, clip) -> None:
+        self._set_opacity(layer.id, 100)
         layer.blending_mode = george.BlendingMode.COLOR
         for lyr in clip.layers:
             want = lyr.id == layer.id
@@ -322,7 +337,7 @@ class TVPaintBackend:
             "name": old.name,
             "start": old.start,
             "position": old.position,
-            "opacity": old.opacity,
+            "opacity": self._get_opacity(old.id),
             "blending_mode": old.blending_mode,
             "pre_behavior": old.pre_behavior,
             "post_behavior": old.post_behavior,
@@ -341,9 +356,11 @@ class TVPaintBackend:
         new.refresh()
         if new.start != props["start"]:
             new.shift(props["start"])
-        for attr in ("opacity", "blending_mode", "pre_behavior", "post_behavior", "is_visible"):
+        for attr in ("blending_mode", "pre_behavior", "post_behavior", "is_visible"):
             with contextlib.suppress(Exception):
                 setattr(new, attr, props[attr])
+        with contextlib.suppress(Exception):
+            self._set_opacity(new_id, props["opacity"])
         if color_index is not None:
             with contextlib.suppress(Exception):
                 george.tv_layer_color_set(new_id, color_index)
@@ -366,13 +383,13 @@ class TVPaintBackend:
         field = src_project.field_order
         start_frame = src_project.start_frame
         props = {
-            "opacity": src_layer.opacity,
+            "opacity": self._get_opacity(src_layer.id),
             "blending_mode": src_layer.blending_mode,
             "pre_behavior": src_layer.pre_behavior,
             "post_behavior": src_layer.post_behavior,
         }
 
-        new_path = self._crop_project_path(src_project, spec.source.name)
+        new_path = self._new_project_path(src_project, "Crop")
         src_id = george.tv_project_current_id()
 
         try:
@@ -387,7 +404,7 @@ class TVPaintBackend:
                 if lid != layer_id:
                     with contextlib.suppress(Exception):
                         george.tv_layer_kill(lid)
-            george.tv_layer_rename(layer_id, spec.source.name)
+            george.tv_layer_rename(layer_id, "Crop")  # 한글 이름이 깨지므로 고정 이름 사용
             layer = Layer(layer_id=layer_id, clip=clip)
             layer.make_current()
             layer.refresh()
@@ -404,7 +421,10 @@ class TVPaintBackend:
                 layer.shift(src_start)
             for attr, value in props.items():
                 with contextlib.suppress(Exception):
-                    setattr(layer, attr, value)
+                    if attr == "opacity":
+                        self._set_opacity(layer.id, value)
+                    else:
+                        setattr(layer, attr, value)
             clip.current_frame = src_start
 
             layer.refresh()
@@ -428,9 +448,75 @@ class TVPaintBackend:
                 george.tv_project_select(src_id)
             raise
 
+    def build_atlas_project(self, source: LayerRef, atlas_png: Path, layout, work: Path) -> str:
+        src_layer = self._layer(source)
+        src_project = src_layer.project
+        fps = src_project.fps
+        par = src_project.pixel_aspect_ratio
+        field = src_project.field_order
+        start_frame = src_project.start_frame
+
+        new_path = self._new_project_path(src_project, "Atlas")
+        src_id = george.tv_project_current_id()
+        try:
+            project = Project.new(new_path, layout.width, layout.height, par, fps, field, start_frame)
+            project.make_current()
+            if (project.width, project.height) != (layout.width, layout.height):
+                raise ToolError(
+                    f"TVPaint가 {layout.width}×{layout.height} 크기의 프로젝트를 만들지 못했습니다 "
+                    f"(만들어진 크기 {project.width}×{project.height}). 캔버스 최대 크기를 넘었을 수 있습니다."
+                )
+            clip = project.current_clip
+            defaults = [lyr.id for lyr in clip.layers]
+            clip.current_frame = start_frame
+            layer_id = self._load_images_as_layer(clip, [atlas_png], work, "atlas")
+            for lid in defaults:
+                if lid != layer_id:
+                    with contextlib.suppress(Exception):
+                        george.tv_layer_kill(lid)
+            george.tv_layer_rename(layer_id, "Atlas")
+            Layer(layer_id=layer_id, clip=clip).make_current()
+            clip.current_frame = start_frame
+            return project.name
+        except Exception:
+            with contextlib.suppress(Exception):
+                current = george.tv_project_current_id()
+                if current != src_id:
+                    george.tv_project_close(current)
+            with contextlib.suppress(Exception):
+                george.tv_project_select(src_id)
+            raise
+
+    # ---------- 새 프로젝트 이름/위치 ----------
     @staticmethod
-    def _crop_project_path(src_project: Project, layer_name: str) -> Path:
-        """새 프로젝트 경로. 저장 안 된 프로젝트는 TVPaint 가 경로를 따옴표 등으로 돌려주므로 정리해서 판단한다."""
+    def _desktop_dir() -> Path:
+        """바탕화면 경로. 한글이 섞인 경로(예: OneDrive 의 '바탕 화면')는 TVPaint 에서 깨지므로 피한다."""
+        candidates: list[Path] = []
+        if os.name == "nt":
+            with contextlib.suppress(Exception):
+                import ctypes
+                from ctypes import wintypes
+
+                class GUID(ctypes.Structure):
+                    _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD), ("d3", wintypes.WORD), ("d4", ctypes.c_ubyte * 8)]
+
+                desktop = GUID(0xB4BFCC3A, 0xDB2C, 0x424C, (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41))
+                out = ctypes.c_wchar_p()
+                if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(desktop), 0, None, ctypes.byref(out)) == 0:
+                    candidates.append(Path(out.value))
+                    ctypes.windll.ole32.CoTaskMemFree(out)
+        candidates += [Path.home() / "Desktop", Path.home()]
+        for c in candidates:
+            if str(c).isascii() and c.is_dir():
+                return c
+        return Path.home()
+
+    def _new_project_path(self, src_project: Project, prefix: str) -> Path:
+        """Crop_01, Crop_02 ... 처럼 겹치지 않는 번호로 만든다.
+
+        저장 위치: 원본이 저장돼 있고 경로가 영문이면 원본 폴더, 아니면 바탕화면.
+        겹침 확인: 저장 폴더의 파일 + TVPaint 에 열려 있는 프로젝트 이름.
+        """
 
         def clean(text: str) -> str:
             return text.strip().strip('"').strip("'").strip()
@@ -438,18 +524,25 @@ class TVPaintBackend:
         raw = ""
         with contextlib.suppress(Exception):
             raw = clean(george.tv_get_project_name())
-        if not raw:
-            with contextlib.suppress(Exception):
-                raw = clean(str(src_project.path))
         src = Path(raw) if raw else None
-        if src is not None and src.suffix.lower() in (".tvpp", ".tvp") and src.parent.is_dir():
-            base_dir, stem = src.parent, src.stem
+        if (
+            src is not None
+            and src.suffix.lower() in (".tvpp", ".tvp")
+            and str(src.parent).isascii()
+            and src.parent.is_dir()
+        ):
+            folder = src.parent
         else:
-            docs = Path.home() / "Documents"
-            base_dir, stem = (docs if docs.is_dir() else Path.home()), "untitled"
+            folder = self._desktop_dir()
 
-        def part(text: str) -> str:
-            cleaned = safe_filename(text).replace(" ", "_").replace("'", "_")
-            return cleaned if cleaned.strip("_") else "untitled"
-
-        return base_dir / f"{part(stem)}_{part(layer_name)}_crop.tvpp"
+        taken: set[str] = set()
+        with contextlib.suppress(Exception):
+            for project_id in Project.open_projects_ids():
+                with contextlib.suppress(Exception):
+                    taken.add(Path(clean(str(george.tv_project_info(project_id).path))).stem.lower())
+        n = 1
+        while True:
+            name = f"{prefix}_{n:02d}"
+            if name.lower() not in taken and not (folder / f"{name}.tvpp").exists():
+                return folder / f"{name}.tvpp"
+            n += 1

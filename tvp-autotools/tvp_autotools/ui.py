@@ -8,7 +8,7 @@ from tkinter import filedialog
 from typing import Callable
 
 from tvp_autotools import installer
-from tvp_autotools.ops import LayerRef, ToolError, run_compact, run_crop
+from tvp_autotools.ops import AtlasPlan, LayerRef, ToolError, analyze_atlas, build_atlas, run_compact, run_crop
 from tvp_autotools.worker import Worker
 
 # TVPaint 11.6 계열: 짙은 회색 패널, 낮은 대비 버튼, 청회색 선택 강조
@@ -36,6 +36,8 @@ F_SMALL = (FONT, 8)
 F_BODY = (FONT, 9)
 F_LAYER = (FONT, 11, "bold")
 F_BUTTON = (FONT, 10)
+
+APP_TITLE = "TVPaint Auto Crop & Atlas Maker"
 
 POLL_MS = 300  # 가벼운 조회(레이어 id, 이름)만 하므로 짧게 잡는다
 
@@ -79,7 +81,8 @@ class Progress(tk.Canvas):
 class App:
     def __init__(self, backend_factory: Callable[[], object]) -> None:
         self.root = tk.Tk()
-        self.root.title("TVPaint Auto Crop")
+        self.root.title(APP_TITLE)
+        self.root.minsize(470, 0)  # 긴 제목이 제목 표시줄에서 잘리지 않도록
         self.root.configure(bg=C["window"])
         self.root.resizable(False, False)
         self._set_icon()
@@ -114,6 +117,7 @@ class App:
             bg=C["window"], fg=C["text_dim"], selectcolor=C["field"], activebackground=C["window"],
             activeforeground=C["text"], font=F_SMALL, bd=0, highlightthickness=0,
         )
+        FlatButton(top, "도움말", self._show_help, font=F_SMALL, pady=1).pack(side="right", padx=(8, 0))
         pin.pack(side="right")
         self._apply_pin()
 
@@ -122,15 +126,18 @@ class App:
         tk.Label(panel, text="현재 선택 레이어", fg=C["text_dim"], bg=C["panel"], font=F_SMALL).pack(anchor="w")
         field = tk.Frame(panel, bg=C["field"], padx=8, pady=6)
         field.pack(fill="x", pady=(3, 3))
-        self.layer_label = tk.Label(field, text="—", fg=C["text"], bg=C["field"], font=F_LAYER, anchor="w", width=26)
+        self.layer_label = tk.Label(field, text="—", fg=C["text"], bg=C["field"], font=F_LAYER, anchor="w", width=34)
         self.layer_label.pack(fill="x")
         self.layer_sub = tk.Label(panel, text="", fg=C["text_dim"], bg=C["panel"], font=F_SMALL, anchor="w")
         self.layer_sub.pack(fill="x")
 
+        # 권장 작업 순서대로 배치: 불필요 프레임 삭제 → Crop → Atlas 생성
+        self.btn_clean = FlatButton(outer, "불필요 프레임 삭제", lambda: self._ask("clean"))
+        self.btn_clean.pack(fill="x", pady=(0, 6))
         self.btn_crop = FlatButton(outer, "Crop", lambda: self._ask("crop"))
         self.btn_crop.pack(fill="x", pady=(0, 6))
-        self.btn_clean = FlatButton(outer, "불필요 프레임 삭제", lambda: self._ask("clean"))
-        self.btn_clean.pack(fill="x")
+        self.btn_atlas = FlatButton(outer, "Atlas 생성", lambda: self._ask("atlas"))
+        self.btn_atlas.pack(fill="x")
 
         self.progress = Progress(outer)
         self.progress.pack(fill="x", pady=(10, 4))
@@ -161,8 +168,8 @@ class App:
 
     def _refresh_controls(self) -> None:
         can_run = self.connected and not self.running and self.layer is not None
-        self.btn_crop.set_enabled(can_run)
-        self.btn_clean.set_enabled(can_run)
+        for btn in (self.btn_clean, self.btn_crop, self.btn_atlas):
+            btn.set_enabled(can_run)
         if self.connected:
             self.conn_row.pack_forget()
         else:
@@ -262,32 +269,54 @@ class App:
 
         def got_layer(layer: LayerRef):
             self._show_layer(layer)
-            title = "Crop" if which == "crop" else "불필요 프레임 삭제"
-            detail = (
-                "선택 레이어의 실제 그림 영역만큼 잘라 새 프로젝트를 만듭니다.\n원본 프로젝트는 바뀌지 않습니다."
-                if which == "crop"
-                else "빈 프레임과 중복 그림을 지우고 전부 1콤마로 만듭니다.\nCtrl+Z 한 번으로 되돌릴 수 있습니다."
-            )
+            if which == "atlas":
+                # Atlas 는 확인창에 셀/배치 정보를 보여줘야 하므로 분석을 먼저 한다 (원본은 바뀌지 않음)
+                self._start(lambda p: analyze_atlas(self.backend, layer.id, p), self._confirm_atlas)
+                return
+            if which == "crop":
+                title = "Crop"
+                detail = "선택 레이어의 실제 그림 영역만큼 잘라 새 프로젝트를 만듭니다.\n원본 프로젝트는 바뀌지 않습니다."
+                fn = run_crop
+            else:
+                title = "불필요 프레임 삭제"
+                detail = "빈 프레임과 중복 그림을 지우고 전부 1콤마로 만듭니다.\nCtrl+Z 한 번으로 되돌릴 수 있습니다."
+                fn = run_compact
             if ConfirmDialog(self.root, title, layer.name, detail).result:
-                self._run(which, layer)
+                self._start(lambda p: fn(self.backend, layer.id, p), self._show_summary)
 
         self.worker.submit(lambda: self.backend.current_layer(), got_layer, self._on_connect_failed)
 
-    def _run(self, which: str, layer: LayerRef) -> None:
+    def _confirm_atlas(self, plan: AtlasPlan) -> None:
+        L = plan.layout
+        detail = (
+            f"Frames: {L.count}\n"
+            f"Cell: {L.cell_w} × {L.cell_h}\n"
+            f"Layout: {L.cols}열 × {L.rows}행\n"
+            f"Atlas: {L.width} × {L.height}"
+        )
+        self.message.config(text="", fg=C["text_dim"])
+        if ConfirmDialog(self.root, "Atlas 생성", plan.layer.name, detail, question="Atlas를 생성하시겠습니까?").result:
+            self._start(lambda p: build_atlas(self.backend, plan, p), self._show_summary)
+        else:
+            plan.discard()
+
+    def _show_summary(self, summary: str) -> None:
+        self.message.config(text="완료", fg=C["ok"])
+        MessageDialog(self.root, "완료", summary)
+
+    def _start(self, job: Callable[[Callable[[str, float], None]], object], on_done: Callable[[object], None]) -> None:
         self.running = True
         self._refresh_controls()
         self.message.config(text="")
-        fn = run_crop if which == "crop" else run_compact
 
         def progress(msg: str, value: float) -> None:
             self.worker.post(lambda: (self.message.config(text=msg, fg=C["text_dim"]), self.progress.set(value)))
 
-        def done(summary: str):
+        def done(value):
             self.running = False
             self.progress.set(0)
-            self.message.config(text="완료", fg=C["ok"])
             self._refresh_controls()
-            MessageDialog(self.root, "완료", summary)
+            on_done(value)
 
         def fail(exc: BaseException, tb: str):
             self.running = False
@@ -303,7 +332,10 @@ class App:
                 self.message.config(text="오류", fg=C["bad"])
                 MessageDialog(self.root, "오류", f"{exc}\n\n--- 상세 ---\n{tb[-1500:]}", copyable=True)
 
-        self.worker.submit(lambda: fn(self.backend, layer.id, progress), done, fail)
+        self.worker.submit(lambda: job(progress), done, fail)
+
+    def _show_help(self) -> None:
+        HelpDialog(self.root)
 
     def _install_plugin(self) -> None:
         dirs = installer.find_plugin_dirs()
@@ -354,7 +386,7 @@ class _Dialog(tk.Toplevel):
 
 
 class ConfirmDialog(_Dialog):
-    def __init__(self, master, title: str, layer_name: str, detail: str):
+    def __init__(self, master, title: str, layer_name: str, detail: str, question: str = "정말 진행하시겠습니까?"):
         super().__init__(master, title)
         self.result = False
         tk.Label(self.body, text="현재 선택된 레이어:", fg=C["text_dim"], bg=C["window"], font=F_BODY).pack(anchor="w")
@@ -362,7 +394,7 @@ class ConfirmDialog(_Dialog):
         box.pack(fill="x", pady=(3, 10))
         tk.Label(box, text=layer_name, fg=C["text"], bg=C["field"], font=F_LAYER, anchor="w").pack(fill="x")
         tk.Label(self.body, text=detail, fg=C["text_dim"], bg=C["window"], font=F_SMALL, justify="left").pack(anchor="w")
-        tk.Label(self.body, text="정말 진행하시겠습니까?", fg=C["text"], bg=C["window"], font=F_BODY).pack(anchor="w", pady=(10, 12))
+        tk.Label(self.body, text=question, fg=C["text"], bg=C["window"], font=F_BODY).pack(anchor="w", pady=(10, 12))
         row = tk.Frame(self.body, bg=C["window"])
         row.pack(fill="x")
         FlatButton(row, "취소", self._cancel, font=F_BODY, pady=4).pack(side="right")
@@ -389,6 +421,65 @@ class MessageDialog(_Dialog):
             t.pack(fill="both")
         else:
             tk.Label(self.body, text=text, fg=C["text"], bg=C["window"], font=F_BODY, justify="left", wraplength=360).pack(anchor="w")
+        row = tk.Frame(self.body, bg=C["window"])
+        row.pack(fill="x", pady=(14, 0))
+        FlatButton(row, "확인", self.destroy, primary=True, font=F_BODY, pady=4).pack(side="right")
+        self.bind("<Return>", lambda e: self.destroy())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._show()
+
+
+HELP_STEPS = [
+    ("1. 불필요 프레임 삭제", "복사된 프레임, 콤마가 적용된 프레임, 빈 프레임을 감지해 제거합니다.\n실행 취소가 가능합니다."),
+    ("2. Crop", "모든 프레임을 감지해 최적화된 영역으로 잘라냅니다. 새 프로젝트를 만듭니다."),
+    ("3. Atlas 생성", "이미지를 최대한 정사각형에 가까운 형태의 아틀라스로 만듭니다.\n새 프로젝트를 만듭니다."),
+]
+
+
+def _load_app_icon(size: int):
+    """도움말 머리글용 아이콘. EXE 에 들어 있는 icon.ico 를 읽는다 (없으면 None)."""
+    import sys
+
+    try:
+        from PIL import Image, ImageTk
+
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+        with Image.open(base / "assets" / "icon.ico") as ico:
+            im = ico.convert("RGBA").resize((size, size), Image.LANCZOS)
+        return ImageTk.PhotoImage(im)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class HelpDialog(_Dialog):
+    def __init__(self, master):
+        super().__init__(master, "도움말")
+        head = tk.Frame(self.body, bg=C["window"])
+        head.pack(fill="x")
+        self._icon = _load_app_icon(40)  # 참조를 붙잡아 두지 않으면 이미지가 사라진다
+        if self._icon is not None:
+            tk.Label(head, image=self._icon, bg=C["window"]).pack(side="left", padx=(0, 10))
+        tk.Label(head, text=APP_TITLE, fg=C["text"], bg=C["window"], font=F_LAYER).pack(side="left", anchor="w")
+
+        intro = (
+            "시퀀스 이미지의 영역을 크롭해 게임용 아틀라스 이미지로 만드는 도구입니다.\n"
+            "모든 작업은 표기된 '현재 선택 레이어' 기준으로 진행됩니다."
+        )
+        tk.Label(self.body, text=intro, fg=C["text"], bg=C["window"], font=F_BODY, justify="left", wraplength=460).pack(
+            anchor="w", pady=(12, 12)
+        )
+
+        panel = tk.Frame(self.body, bg=C["panel"], highlightthickness=1, highlightbackground=C["panel_edge"], padx=12, pady=10)
+        panel.pack(fill="x")
+        tk.Label(panel, text="권장 순서", fg=C["text_dim"], bg=C["panel"], font=F_SMALL).pack(anchor="w", pady=(0, 6))
+        for n, (title, desc) in enumerate(HELP_STEPS):
+            tk.Label(panel, text=title, fg=C["text"], bg=C["panel"], font=(FONT, 10, "bold")).pack(
+                anchor="w", pady=(0 if n == 0 else 10, 2)
+            )
+            tk.Label(panel, text=desc, fg=C["text_dim"], bg=C["panel"], font=F_BODY, justify="left", wraplength=440).pack(
+                anchor="w"
+            )
+
         row = tk.Frame(self.body, bg=C["window"])
         row.pack(fill="x", pady=(14, 0))
         FlatButton(row, "확인", self.destroy, primary=True, font=F_BODY, pady=4).pack(side="right")

@@ -174,3 +174,67 @@ def group_runs(frames: list[int], infos: list[ImageInfo]) -> list[tuple[int, int
             runs.append((frame, 1))
             prev = info.signature
     return runs
+
+
+# ---------------- Atlas ----------------
+# 기존 Photoshop Atlas Builder v3.1 규칙을 그대로 옮긴 것. 임의로 바꾸지 말 것.
+
+TIE_EPSILON = 1e-9  # squarePenalty 동률 판정 (부동소수점 오차 수준만 동률로 본다)
+
+
+@dataclass(frozen=True)
+class AtlasLayout:
+    cols: int
+    rows: int
+    cell_w: int
+    cell_h: int
+    padding: int
+    width: int
+    height: int
+    count: int
+
+    def cell_origin(self, index: int) -> tuple[int, int]:
+        """프레임 index 의 셀 좌상단. 원본 크롭 (0,0) 이 이 좌표에 그대로 놓인다 (중앙정렬 없음)."""
+        col = index % self.cols
+        row = index // self.cols
+        return col * (self.cell_w + self.padding), row * (self.cell_h + self.padding)
+
+
+def choose_atlas_layout(count: int, cell_w: int, cell_h: int, padding: int = 0) -> AtlasLayout:
+    """모든 열 수 후보를 검사해 실제 픽셀 비율이 가장 정사각형에 가까운 구성을 고른다.
+
+    점수: abs(log(atlasW / atlasH)). 동률이면 1) 빈 셀이 적은 쪽 2) 면적이 작은 쪽.
+    """
+    import math
+
+    if count < 1 or cell_w < 1 or cell_h < 1:
+        raise ValueError("프레임 수와 셀 크기는 1 이상이어야 합니다.")
+
+    best: AtlasLayout | None = None
+    best_key: tuple[float, int, int] | None = None
+    for cols in range(1, count + 1):
+        rows = math.ceil(count / cols)
+        width = cols * cell_w + (cols - 1) * padding
+        height = rows * cell_h + (rows - 1) * padding
+        penalty = abs(math.log(width / height))
+        waste = cols * rows - count
+        area = width * height
+        candidate = AtlasLayout(cols, rows, cell_w, cell_h, padding, width, height, count)
+        if best_key is None or penalty < best_key[0] - TIE_EPSILON:
+            best, best_key = candidate, (penalty, waste, area)
+        elif abs(penalty - best_key[0]) <= TIE_EPSILON and (waste, area) < (best_key[1], best_key[2]):
+            best, best_key = candidate, (min(penalty, best_key[0]), waste, area)
+    assert best is not None
+    return best
+
+
+def compose_atlas(images: list[Path], layout: AtlasLayout, dst: Path) -> None:
+    """셀 크기와 정확히 같은 이미지들을 셀 좌상단에 1:1 로 붙인다. 빈 셀은 완전 투명."""
+    atlas = Image.new("RGBA", (layout.width, layout.height), (0, 0, 0, 0))
+    for index, path in enumerate(images):
+        with Image.open(path) as src:
+            im = src.convert("RGBA")
+        if im.size != (layout.cell_w, layout.cell_h):
+            raise ValueError(f"{index + 1}번째 프레임 크기 {im.size}가 셀 크기와 다릅니다.")
+        atlas.paste(im, layout.cell_origin(index))  # 마스크 없이 붙여 알파까지 그대로 복사
+    atlas.save(dst, format="PNG")

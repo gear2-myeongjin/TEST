@@ -16,6 +16,9 @@ from tvp_autotools.core import (
     Instance,
     analyze_image,
     crop_image,
+    AtlasLayout,
+    choose_atlas_layout,
+    compose_atlas,
     group_runs,
     plan_frames,
     union_bbox,
@@ -55,6 +58,7 @@ class Backend(Protocol):
     def undo_group(self, name: str) -> AbstractContextManager[None]: ...
     def replace_layer_frames(self, layer: LayerRef, images: list[Path], work: Path) -> int: ...
     def build_cropped_project(self, spec: CropSpec, work: Path) -> str: ...
+    def build_atlas_project(self, source: LayerRef, atlas_png: Path, layout: AtlasLayout, work: Path) -> str: ...
 
 
 def _make_workdir() -> Path:
@@ -65,12 +69,12 @@ def _make_workdir() -> Path:
     for base in candidates:
         if base and base.isascii() and " " not in base and os.path.isdir(base):
             try:
-                root = Path(base) / "tvp_autocrop_tmp"
+                root = Path(base) / "tvpaam_tmp"
                 root.mkdir(exist_ok=True)
                 return Path(tempfile.mkdtemp(prefix="w_", dir=root))
             except OSError:
                 continue
-    return Path(tempfile.mkdtemp(prefix="tvp_autocrop_"))
+    return Path(tempfile.mkdtemp(prefix="tvpaam_"))
 
 
 def _check_layer(layer: LayerRef, expected_id: int | None) -> None:
@@ -133,7 +137,7 @@ def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progr
             return f"'{layer.name}': 정리할 프레임이 없습니다. (이미 {len(plan.keep)}장 1콤마)" + _method_note(backend)
 
         progress("레이어 다시 구성 중", 0.75)
-        with backend.undo_group("AutoCrop_CleanFrames"):
+        with backend.undo_group("TvpAAM_CleanFrames"):
             result_count = backend.replace_layer_frames(layer, [files[f] for f in plan.keep], work)
 
         lines = [
@@ -197,3 +201,69 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------------- Atlas ----------------
+
+
+@dataclass
+class AtlasPlan:
+    """분석 결과. 확인창에 보여준 뒤 build_atlas 로 넘긴다 (임시 폴더는 build/discard 에서 지운다)."""
+
+    layer: LayerRef
+    layout: AtlasLayout
+    work: Path
+    cells: list[Path]
+
+    def discard(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+
+
+def analyze_atlas(backend: Backend, expected_layer_id: int | None, progress: Progress) -> AtlasPlan:
+    """현재 레이어의 타임라인 프레임을 있는 그대로, 공통 union bounds 크기의 셀로 만든다."""
+    layer = backend.current_layer()
+    _check_layer(layer, expected_layer_id)
+
+    work = _make_workdir()
+    try:
+        frames, files, infos = _render_and_analyze(backend, layer, work, progress)
+        bbox = union_bbox([i.bbox for i in infos])
+        if bbox is None:
+            raise ToolError("레이어 전체가 빈 프레임이라 Atlas를 만들 수 없습니다.")
+        progress("셀 이미지 만드는 중", 0.75)
+        cell_dir = work / "cells"
+        cell_dir.mkdir()
+        cells: list[Path] = []
+        for n, frame in enumerate(frames):
+            dst = cell_dir / f"cell_{n:05d}.png"
+            crop_image(files[frame], dst, bbox)  # 모든 프레임을 같은 bbox 로: 프레임 내부 좌표 보존
+            cells.append(dst)
+        left, top, right, bottom = bbox
+        layout = choose_atlas_layout(len(cells), right - left, bottom - top)
+        progress("분석 완료", 1.0)
+        return AtlasPlan(layer=layer, layout=layout, work=work, cells=cells)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+
+
+def build_atlas(backend: Backend, plan: AtlasPlan, progress: Progress) -> str:
+    try:
+        current = backend.current_layer()
+        _check_layer(current, plan.layer.id)
+        progress("Atlas 합성 중", 0.3)
+        atlas_png = plan.work / "atlas.png"
+        compose_atlas(plan.cells, plan.layout, atlas_png)
+        progress("새 프로젝트 생성 중", 0.6)
+        name = backend.build_atlas_project(plan.layer, atlas_png, plan.layout, plan.work)
+        progress("완료", 1.0)
+        L = plan.layout
+        return (
+            f"'{plan.layer.name}' Atlas 생성 완료\n"
+            f"새 프로젝트: {name}\n"
+            f"프레임 {L.count}개, 셀 {L.cell_w}×{L.cell_h}, {L.cols}열 × {L.rows}행\n"
+            f"Atlas {L.width}×{L.height}, 원본 프로젝트는 변경되지 않았습니다.\n"
+            "새 프로젝트는 아직 저장되지 않았습니다."
+        )
+    finally:
+        plan.discard()
