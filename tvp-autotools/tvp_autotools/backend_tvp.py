@@ -27,6 +27,8 @@ class TVPaintBackend:
     def __init__(self) -> None:
         self._layer_cache: dict[int, Layer] = {}
         self._strategy: str | None = None  # 이 TVPaint 에서 동작이 확인된 저장 방식
+        self.opacity_trace: list[str] = []  # 불투명도 읽기/쓰기 기록 (검증 실패 시 진단용)
+        self.opacity_check: str | None = None
 
     # ---------- 연결 ----------
     def connect(self) -> None:
@@ -60,14 +62,44 @@ class TVPaintBackend:
 
     # pytvpaint 의 Layer.opacity 는 '현재 레이어'의 값을 읽는 명령을 써서, 다른 레이어가 현재일 때 엉뚱한 값을
     # 돌려줄 수 있다. 불투명도는 레이어 id 로 정보를 읽고, 쓸 때는 그 레이어를 현재로 만든 뒤 쓴다.
-    @staticmethod
-    def _get_opacity(layer_id: int) -> int:
-        return int(george.tv_layer_info(layer_id).density)
+    def _read_opacity_both(self, layer_id: int) -> tuple[int | None, int | None]:
+        """레이어 정보(tv_LayerInfo)와 현재 레이어 지정 후 읽기(tv_LayerDensity), 두 방법으로 읽는다."""
+        info = get = None
+        with contextlib.suppress(Exception):
+            info = int(george.tv_layer_info(layer_id).density)
+        with contextlib.suppress(Exception):
+            george.tv_layer_set(layer_id)
+            get = int(george.tv_layer_density_get())
+        return info, get
 
-    @staticmethod
-    def _set_opacity(layer_id: int, value: int) -> None:
+    def _get_opacity(self, layer_id: int) -> int:
+        info, get = self._read_opacity_both(layer_id)
+        self._trace(f"읽기 layer {layer_id}: info={info} density={get}")
+        value = info if info is not None else get
+        if value is None:
+            raise ToolError("레이어 불투명도를 읽지 못했습니다.")
+        return value
+
+    def _set_opacity(self, layer_id: int, value: int) -> None:
+        value = max(0, min(100, int(value)))
         george.tv_layer_set(layer_id)
-        george.tv_layer_density_set(max(0, min(100, int(value))))
+        george.tv_layer_density_set(value)
+        self._trace(f"쓰기 layer {layer_id}: {value} -> 확인 {self._read_opacity_both(layer_id)}")
+
+    def read_layer_opacity(self, ref: LayerRef) -> int | None:
+        self.opacity_trace = []
+        self.opacity_check = None
+        layer = self._layer(ref)
+        try:
+            return self._get_opacity(layer.id)
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            with contextlib.suppress(Exception):
+                layer.make_current()
+
+    def _trace(self, text: str) -> None:
+        self.opacity_trace.append(text)
 
     def _layer(self, ref: LayerRef) -> Layer:
         layer = self._layer_cache.get(ref.id)
@@ -97,7 +129,7 @@ class TVPaintBackend:
         restore = self._snapshot_render_state(layer, clip)
         attempts: list[str] = []
         try:
-            self._isolate_layer(layer, clip)
+            self._isolate_layer(layer, clip, restore.opacity)
             strategy = self._pick_strategy(layer, clip, starts[0], start_frame, size, out_dir, attempts)
             if strategy is None:
                 raise ToolError(self._render_diagnostics(layer, starts, out_dir, attempts))
@@ -144,7 +176,7 @@ class TVPaintBackend:
                 steps.append(lambda: george.tv_alpha_save_mode_set(alpha_save))
             if save_mode is not None:
                 steps.append(lambda: george.tv_save_mode_set(save_mode[0], *save_mode[1]))
-            if opacity is not None:
+            if opacity is not None and opacity != 100:
                 steps.append(lambda: self._set_opacity(layer.id, opacity))
             if blending is not None:
                 steps.append(lambda: setattr(layer, "blending_mode", blending))
@@ -164,10 +196,13 @@ class TVPaintBackend:
                         self._set_opacity(layer.id, opacity)
                         layer.make_current()
 
+        restore.opacity = opacity
         return restore
 
-    def _isolate_layer(self, layer: Layer, clip) -> None:
-        self._set_opacity(layer.id, 100)
+    def _isolate_layer(self, layer: Layer, clip, opacity: int | None) -> None:
+        # 이미 100% 면 불투명도는 아예 건드리지 않는다 (쓰기 횟수를 최소화)
+        if opacity != 100:
+            self._set_opacity(layer.id, 100)
         layer.blending_mode = george.BlendingMode.COLOR
         for lyr in clip.layers:
             want = lyr.id == layer.id
@@ -359,8 +394,9 @@ class TVPaintBackend:
         for attr in ("blending_mode", "pre_behavior", "post_behavior", "is_visible"):
             with contextlib.suppress(Exception):
                 setattr(new, attr, props[attr])
-        with contextlib.suppress(Exception):
-            self._set_opacity(new_id, props["opacity"])
+        if props["opacity"] != 100:  # 새 레이어 기본값은 100% 이므로 필요할 때만 쓴다
+            with contextlib.suppress(Exception):
+                self._set_opacity(new_id, props["opacity"])
         if color_index is not None:
             with contextlib.suppress(Exception):
                 george.tv_layer_color_set(new_id, color_index)
@@ -420,11 +456,10 @@ class TVPaintBackend:
             if layer.start != src_start:
                 layer.shift(src_start)
             for attr, value in props.items():
+                if attr == "opacity":
+                    continue  # 마지막 검증 단계에서 처리
                 with contextlib.suppress(Exception):
-                    if attr == "opacity":
-                        self._set_opacity(layer.id, value)
-                    else:
-                        setattr(layer, attr, value)
+                    setattr(layer, attr, value)
             clip.current_frame = src_start
 
             layer.refresh()
@@ -436,6 +471,10 @@ class TVPaintBackend:
                     f"원본 {expected}프레임 / 결과 {actual}프레임.\n"
                     "새 프로젝트는 열린 채로 두었으니 확인해 주세요. 원본은 변경되지 않았습니다."
                 )
+            new_id = george.tv_project_current_id()
+            self.opacity_check = self._verify_opacity(
+                src_id, src_layer.id, new_id, layer.id, spec.source_opacity
+            )
             return project.name
         except ToolError:
             raise
@@ -447,6 +486,32 @@ class TVPaintBackend:
             with contextlib.suppress(Exception):
                 george.tv_project_select(src_id)
             raise
+
+    def _verify_opacity(self, src_pid, src_lid, new_pid, new_lid, expected) -> str | None:
+        """원본 레이어와 Crop 레이어의 불투명도를 작업 시작 전 값과 맞추고, 실제로 맞는지 다시 읽어 확인한다.
+
+        문제가 없으면 None, 끝내 맞지 않으면 진단 기록을 담은 문자열을 돌려준다.
+        """
+        if expected is None:
+            return "작업 시작 전 불투명도를 읽지 못해 확인을 건너뛰었습니다."
+        problems = []
+        for pid, lid, label in ((src_pid, src_lid, "원본"), (new_pid, new_lid, "Crop")):
+            with contextlib.suppress(Exception):
+                george.tv_project_select(pid)
+            info, get = self._read_opacity_both(lid)
+            self._trace(f"{label} 확인 전: info={info} density={get} (기대 {expected})")
+            if info != expected or get != expected:
+                with contextlib.suppress(Exception):
+                    self._set_opacity(lid, expected)
+                info, get = self._read_opacity_both(lid)
+                if info != expected or get != expected:
+                    problems.append(f"{label} 레이어: 기대 {expected}%, 실제 info={info} density={get}")
+        with contextlib.suppress(Exception):
+            george.tv_project_select(new_pid)
+            george.tv_layer_set(new_lid)
+        if problems:
+            return "\n".join(problems + ["--- 기록 ---"] + self.opacity_trace[-30:])
+        return None
 
     def build_atlas_project(self, source: LayerRef, atlas_png: Path, layout, work: Path) -> str:
         src_layer = self._layer(source)

@@ -49,6 +49,7 @@ class CropSpec:
     offset: tuple[int, int]  # 원본 캔버스에서 잘라낸 영역의 좌상단
     instances: list[Instance]
     images: list[Path]  # 인스턴스 순서대로 크롭된 PNG
+    source_opacity: int | None = None  # 작업 시작 전에 읽어 둔 원본 레이어 불투명도
 
 
 class Backend(Protocol):
@@ -161,6 +162,11 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
     layer = backend.current_layer()
     _check_layer(layer, expected_layer_id)
 
+    source_opacity = None
+    reader = getattr(backend, "read_layer_opacity", None)
+    if reader is not None:
+        source_opacity = reader(layer)  # 렌더링 등 어떤 작업보다 먼저 읽는다
+
     work = _make_workdir()
     try:
         frames, files, infos = _render_and_analyze(backend, layer, work, progress)
@@ -187,10 +193,13 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
             offset=(left, top),
             instances=[Instance(start, length) for start, length in runs],
             images=cropped,
+            source_opacity=source_opacity,
         )
         progress("새 프로젝트 생성 중", 0.82)
         project_name = backend.build_cropped_project(spec, work)
         progress("완료", 1.0)
+        check = getattr(backend, "opacity_check", None)
+        warning = f"\n\n⚠ 불투명도 확인 실패 (이 내용을 그대로 전달해 주세요)\n{check}" if check else ""
         return (
             f"'{layer.name}' 크롭 완료\n"
             f"새 프로젝트: {project_name}\n"
@@ -198,6 +207,7 @@ def run_crop(backend: Backend, expected_layer_id: int | None, progress: Progress
             f"프레임 {len(frames)}개, 그림 {len(runs)}장 + 콤마 구조 유지, 원본 프로젝트는 변경되지 않았습니다.\n"
             "새 프로젝트는 아직 저장되지 않았습니다."
             + _method_note(backend)
+            + warning
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
