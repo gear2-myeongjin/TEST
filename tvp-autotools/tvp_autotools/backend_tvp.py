@@ -29,6 +29,9 @@ class TVPaintBackend:
         self._strategy: str | None = None  # 이 TVPaint 에서 동작이 확인된 저장 방식
         self.opacity_trace: list[str] = []  # 불투명도 읽기/쓰기 기록 (검증 실패 시 진단용)
         self.opacity_check: str | None = None
+        # [임시 진단] 단계마다 멈추고 사용자에게 화면의 불투명도를 확인받는다. None 이면 아무 일도 안 한다.
+        self.checkpoint = None
+        self._diag_layer_id: int | None = None
 
     # ---------- 연결 ----------
     def connect(self) -> None:
@@ -95,6 +98,11 @@ class TVPaintBackend:
             with contextlib.suppress(Exception):
                 layer.make_current()
 
+    def _cp(self, desc: str) -> None:
+        if self.checkpoint is None or self._diag_layer_id is None:
+            return
+        self.checkpoint(desc, self._read_opacity(self._diag_layer_id))
+
     def _trace(self, text: str) -> None:
         self.opacity_trace.append(text)
 
@@ -118,19 +126,24 @@ class TVPaintBackend:
 
     def render_frames(self, ref: LayerRef, starts: list[int], out_dir: Path) -> dict[int, Path]:
         layer = self._layer(ref)
+        self._cp("레이어 선택 (tv_LayerSet)")
         clip = layer.clip
         project = layer.project
+        self._cp("클립/프로젝트 정보 읽기")
         size = (project.width, project.height)
         start_frame = project.start_frame
+        self._cp("캔버스 크기, 시작 프레임 읽기")
 
         restore = self._snapshot_render_state(layer, clip)
         attempts: list[str] = []
         try:
             self._isolate_layer(layer, clip, restore.opacity)
             strategy = self._pick_strategy(layer, clip, starts[0], start_frame, size, out_dir, attempts)
+            self._cp(f"저장 방식 시험 끝 ({strategy})")
             if strategy is None:
                 raise ToolError(self._render_diagnostics(layer, starts, out_dir, attempts))
             batch = self._render_batch(strategy, layer, clip, starts, start_frame, size, out_dir)
+            self._cp("전체 프레임 저장 (한 번에)")
             if batch is not None:
                 return batch
             result: dict[int, Path] = {}
@@ -158,34 +171,45 @@ class TVPaintBackend:
                 return None
 
         visibility = [(lyr, safe(lambda l=lyr: l.is_visible)) for lyr in clip.layers]
+        self._cp("모든 레이어 표시 여부 읽기 (tv_LayerDisplay)")
         opacity = safe(lambda: self._get_opacity(layer.id))
+        self._cp("불투명도 읽기 (tv_LayerInfo)")
         blending = safe(lambda: layer.blending_mode)
+        self._cp("블렌딩 모드 읽기 (tv_LayerBlendingMode)")
         background = safe(george.tv_background_get)
+        self._cp("배경 설정 읽기 (tv_Background)")
         alpha_save = safe(george.tv_alpha_save_mode_get)
+        self._cp("알파 저장 방식 읽기 (tv_AlphaSaveMode)")
         save_mode = safe(george.tv_save_mode_get)
+        self._cp("저장 형식 읽기 (tv_SaveMode)")
         frame = safe(lambda: clip.current_frame)
+        self._cp("현재 프레임 읽기")
 
         def restore() -> None:
             steps = []
             if background is not None:
-                steps.append(lambda: george.tv_background_set(background[0], background[1]))
+                steps.append(("복구: 배경 설정", lambda: george.tv_background_set(background[0], background[1])))
             if alpha_save is not None:
-                steps.append(lambda: george.tv_alpha_save_mode_set(alpha_save))
+                steps.append(("복구: 알파 저장 방식", lambda: george.tv_alpha_save_mode_set(alpha_save)))
             if save_mode is not None:
-                steps.append(lambda: george.tv_save_mode_set(save_mode[0], *save_mode[1]))
+                steps.append(("복구: 저장 형식", lambda: george.tv_save_mode_set(save_mode[0], *save_mode[1])))
             if opacity is not None and opacity != 100:
-                steps.append(lambda: self._set_opacity(layer.id, opacity))
+                steps.append(("복구: 불투명도", lambda: self._set_opacity(layer.id, opacity)))
             if blending is not None:
-                steps.append(lambda: setattr(layer, "blending_mode", blending))
-            for lyr, was_visible in visibility:
-                if was_visible is not None:
-                    steps.append(lambda l=lyr, v=was_visible: l.is_visible != v and setattr(l, "is_visible", v))
+                steps.append(("복구: 블렌딩 모드", lambda: setattr(layer, "blending_mode", blending)))
+            vis_steps = [
+                (lambda l=lyr, v=was_visible: l.is_visible != v and setattr(l, "is_visible", v))
+                for lyr, was_visible in visibility
+                if was_visible is not None
+            ]
+            steps.append(("복구: 레이어 표시 여부", lambda: [f() for f in vis_steps]))
             if frame is not None:
-                steps.append(lambda: setattr(clip, "current_frame", frame))
-            steps.append(layer.make_current)
-            for step in steps:
+                steps.append(("복구: 현재 프레임", lambda: setattr(clip, "current_frame", frame)))
+            steps.append(("복구: 원본 레이어 선택", layer.make_current))
+            for label, step in steps:
                 with contextlib.suppress(Exception):
                     step()
+                self._cp(label)
             # 불투명도는 되돌린 뒤 실제 값을 다시 읽어 확인하고, 다르면 한 번 더 맞춘다
             if opacity is not None:
                 with contextlib.suppress(Exception):
@@ -200,15 +224,22 @@ class TVPaintBackend:
         # 이미 100% 면 불투명도는 아예 건드리지 않는다 (쓰기 횟수를 최소화)
         if opacity != 100:
             self._set_opacity(layer.id, 100)
+            self._cp("렌더용 불투명도 100% 설정 (tv_LayerDensity 100)")
         layer.blending_mode = george.BlendingMode.COLOR
+        self._cp("렌더용 블렌딩 모드 설정")
         for lyr in clip.layers:
             want = lyr.id == layer.id
             if lyr.is_visible != want:
                 lyr.is_visible = want
+        self._cp("다른 레이어 숨기기")
         george.tv_save_mode_set(george.SaveFormat.PNG)
+        self._cp("저장 형식 PNG 설정")
         george.tv_alpha_save_mode_set(george.AlphaSaveMode.NO_PREMULTIPLY)
+        self._cp("알파 저장 방식 설정")
         george.tv_background_set(george.BackgroundMode.NONE)
+        self._cp("배경 없음 설정")
         layer.make_current()
+        self._cp("원본 레이어 다시 선택")
 
     def _pick_strategy(self, layer, clip, frame, start_frame, size, out_dir, attempts) -> str | None:
         if self._strategy is not None:
@@ -218,7 +249,9 @@ class TVPaintBackend:
                 self._render_one(name, layer, clip, frame, start_frame, size, out_dir / f"probe_{name}")
             except Exception as exc:  # noqa: BLE001
                 attempts.append(f"{name}: 실패 ({exc})")
+                self._cp(f"저장 방식 시험: {name} (실패)")
                 continue
+            self._cp(f"저장 방식 시험: {name} (성공)")
             attempts.append(f"{name}: 성공")
             self._strategy = name
             return name

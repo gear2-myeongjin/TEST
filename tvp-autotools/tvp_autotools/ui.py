@@ -8,7 +8,16 @@ from tkinter import filedialog
 from typing import Callable
 
 from tvp_autotools import installer
-from tvp_autotools.ops import AtlasPlan, LayerRef, ToolError, analyze_atlas, build_atlas, run_compact, run_crop
+from tvp_autotools.ops import (
+    AtlasPlan,
+    LayerRef,
+    ToolError,
+    analyze_atlas,
+    build_atlas,
+    run_compact,
+    run_crop,
+    run_opacity_diagnosis,
+)
 from tvp_autotools.worker import Worker
 
 # TVPaint 11.6 계열: 짙은 회색 패널, 낮은 대비 버튼, 청회색 선택 강조
@@ -138,6 +147,9 @@ class App:
         self.btn_crop.pack(fill="x", pady=(0, 6))
         self.btn_atlas = FlatButton(outer, "Atlas 생성", lambda: self._ask("atlas"))
         self.btn_atlas.pack(fill="x")
+        # [임시] 불투명도 0% 문제 진단용. 원인을 찾은 뒤 제거한다.
+        self.btn_diag = FlatButton(outer, "불투명도 진단 (임시)", self._diagnose, font=F_SMALL, pady=3)
+        self.btn_diag.pack(fill="x", pady=(10, 0))
 
         self.progress = Progress(outer)
         self.progress.pack(fill="x", pady=(10, 4))
@@ -168,7 +180,7 @@ class App:
 
     def _refresh_controls(self) -> None:
         can_run = self.connected and not self.running and self.layer is not None
-        for btn in (self.btn_clean, self.btn_crop, self.btn_atlas):
+        for btn in (self.btn_clean, self.btn_crop, self.btn_atlas, self.btn_diag):
             btn.set_enabled(can_run)
         if self.connected:
             self.conn_row.pack_forget()
@@ -334,6 +346,64 @@ class App:
 
         self.worker.submit(lambda: job(progress), done, fail)
 
+    def _diagnose(self) -> None:
+        """[임시] 렌더링 단계를 명령 하나마다 멈추고, 화면의 불투명도가 바뀌었는지 사용자에게 확인받는다."""
+        if self.running or not self.connected or self.layer is None:
+            return
+        layer = self.layer
+        detail = (
+            "Crop/Atlas 분석과 같은 렌더링 단계를 실행하면서,\n"
+            "TVPaint에 명령을 하나 보낼 때마다 멈춥니다.\n\n"
+            "멈출 때마다 TVPaint 레이어 패널에서 이 레이어의 불투명도를 보고\n"
+            "[그대로] 또는 [바뀜]을 눌러 주세요.\n"
+            "새 프로젝트는 만들지 않습니다."
+        )
+        if not ConfirmDialog(self.root, "불투명도 진단", layer.name, detail, question="시작하시겠습니까?").result:
+            return
+
+        import threading
+
+        log: list[str] = []
+        state = {"n": 0, "stopped": False, "changed_at": None}
+
+        def checkpoint(desc: str, info_value):
+            state["n"] += 1
+            if state["stopped"]:
+                log.append(f"{state['n']:02d}. {desc} (TVPaint가 알려준 값 {info_value})")
+                return
+            answer = {}
+            done = threading.Event()
+
+            def ask():
+                answer["v"] = DiagStepDialog(self.root, state["n"], desc).result
+                done.set()
+
+            self.worker.post(ask)
+            done.wait()
+            mark = {"same": "그대로", "changed": "◀ 바뀜", "abort": "중단"}[answer["v"]]
+            log.append(f"{state['n']:02d}. {desc} → {mark} (TVPaint가 알려준 값 {info_value})")
+            if answer["v"] == "changed":
+                state["changed_at"] = desc
+            if answer["v"] in ("changed", "abort"):
+                state["stopped"] = True  # 이후로는 묻지 않고 끝까지 진행해 설정을 모두 되돌린다
+
+        def job(progress):
+            self.backend.checkpoint = checkpoint
+            self.backend._diag_layer_id = layer.id
+            try:
+                run_opacity_diagnosis(self.backend, layer.id, progress)
+            finally:
+                self.backend.checkpoint = None
+                self.backend._diag_layer_id = None
+
+        def finished(_):
+            head = (
+                f"바뀐 단계: {state['changed_at']}" if state["changed_at"] else "모든 단계에서 '그대로'로 답하셨습니다."
+            )
+            MessageDialog(self.root, "진단 결과 (이 내용을 그대로 전달해 주세요)", head + "\n\n" + "\n".join(log), copyable=True)
+
+        self._start(job, finished)
+
     def _show_help(self) -> None:
         HelpDialog(self.root)
 
@@ -486,3 +556,30 @@ class HelpDialog(_Dialog):
         self.bind("<Return>", lambda e: self.destroy())
         self.bind("<Escape>", lambda e: self.destroy())
         self._show()
+
+
+class DiagStepDialog(_Dialog):
+    """[임시] 진단 단계 확인창."""
+
+    def __init__(self, master, n: int, desc: str):
+        super().__init__(master, f"진단 {n}단계")
+        self.result = "same"
+        tk.Label(self.body, text=f"{n}단계: 방금 실행한 명령", fg=C["text_dim"], bg=C["window"], font=F_SMALL).pack(anchor="w")
+        box = tk.Frame(self.body, bg=C["field"], padx=8, pady=6)
+        box.pack(fill="x", pady=(3, 10))
+        tk.Label(box, text=desc, fg=C["text"], bg=C["field"], font=F_BODY, anchor="w", justify="left", wraplength=380).pack(fill="x")
+        tk.Label(
+            self.body, text="TVPaint에서 원본 레이어의 불투명도가 바뀌었나요?", fg=C["text"], bg=C["window"], font=F_BODY
+        ).pack(anchor="w", pady=(0, 12))
+        row = tk.Frame(self.body, bg=C["window"])
+        row.pack(fill="x")
+        FlatButton(row, "중단", lambda: self._set("abort"), font=F_BODY, pady=4).pack(side="left")
+        FlatButton(row, "바뀜", lambda: self._set("changed"), font=F_BODY, pady=4).pack(side="right")
+        FlatButton(row, "그대로", lambda: self._set("same"), primary=True, font=F_BODY, pady=4).pack(side="right", padx=(0, 6))
+        self.bind("<Return>", lambda e: self._set("same"))
+        self.protocol("WM_DELETE_WINDOW", lambda: self._set("abort"))
+        self._show()
+
+    def _set(self, value: str) -> None:
+        self.result = value
+        self.destroy()
