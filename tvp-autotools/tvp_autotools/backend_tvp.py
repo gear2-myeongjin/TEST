@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Iterator
 
@@ -60,56 +61,136 @@ class TVPaintBackend:
         layer_id = george.tv_layer_current_id()
         return layer_id, george.tv_layer_info(layer_id).name
 
-    # 불투명도(George 의 density) 처리 규칙 — 실기 진단으로 확인된 사항:
-    #  - 이 TVPaint(11.7) 는 불투명도를 0.0~1.0 으로 주고받는다 (50% = 0.5). 버전에 따라 0~100 일 수 있다.
-    #  - PyTVPaint 는 이 값을 정수로 바꾸면서 소수점을 버린다 ('0.5' -> 0). 그래서 라이브러리 읽기는 쓰지 않고
-    #    tv_LayerInfo 결과 문자열에서 직접 꺼낸다.
-    #  - tv_LayerDensity 를 값 없이 호출하지 않는다.
-    #  - 되돌릴 때는 읽어 둔 원래 숫자를 그 단위 그대로 다시 쓴다 (단위 변환을 거치지 않으므로 오차가 없다).
-    _density_scale: str | None = None  # "fraction"(0~1) | "percent"(0~100), 세션 동안 한 번만 판정
+    # 불투명도(George 의 density) 처리 — 자동 보정 방식
+    # 실기에서 확인된 사실: 레이어 정보(tv_LayerInfo)의 불투명도 칸이 화면 값과 다를 수 있고, 쓰기 단위도
+    # 버전에 따라 0~1 / 0~100 으로 다르다. 그래서 첫 사용 때 '임시 프로젝트'에서 쓰기 2가지 × 읽기 2가지를
+    # 직접 시험해, 쓴 값이 그대로 읽히는 조합만 사용한다. 맞는 조합이 없으면 불투명도를 아예 건드리지 않는다.
+    _calibration: dict | None = None
 
     @staticmethod
-    def _read_density(layer_id: int) -> float | None:
-        """tv_LayerInfo 의 세 번째 값(불투명도)을 TVPaint 단위 그대로 읽는다."""
+    def _raw_info_density(layer_id: int) -> str | None:
         from pytvpaint.george.client import send_cmd
 
         with contextlib.suppress(Exception):
-            return float(str(send_cmd("tv_LayerInfo", layer_id)).split()[2])
+            return str(send_cmd("tv_LayerInfo", layer_id)).split()[2]
         return None
 
     @staticmethod
-    def _write_density(layer_id: int, value: float) -> None:
-        george.tv_layer_set(layer_id)
+    def _raw_current_density(layer_id: int) -> str | None:
         from pytvpaint.george.client import send_cmd
 
-        text = f"{value:.6f}".rstrip("0").rstrip(".") if value != int(value) else str(int(value))
+        with contextlib.suppress(Exception):
+            george.tv_layer_set(layer_id)
+            return str(send_cmd("tv_LayerDensity")).strip()
+        return None
+
+    @staticmethod
+    def _to_float(raw: str | None) -> float | None:
+        with contextlib.suppress(Exception):
+            return float(str(raw).strip().strip('"'))
+        return None
+
+    @staticmethod
+    def _send_density(layer_id: int, value: float) -> None:
+        from pytvpaint.george.client import send_cmd
+
+        george.tv_layer_set(layer_id)
+        text = str(int(value)) if value == int(value) else f"{value:.6f}".rstrip("0").rstrip(".")
         send_cmd("tv_LayerDensity", text)
 
-    def _scale(self, layer_id: int, current: float) -> str:
-        """TVPaint 가 불투명도를 0~1 로 쓰는지 0~100 으로 쓰는지 판정한다."""
-        if self._density_scale is None:
-            if current > 1.0:
-                self._density_scale = "percent"
-            elif current != int(current):
-                self._density_scale = "fraction"
-            else:
-                # 0 또는 1 은 두 단위 모두 가능: 0.5 를 써 보고 그대로 읽히면 0~1 단위다. 원래 값은 바로 되돌린다.
+    def _calibrate(self) -> dict:
+        if self._calibration is not None:
+            return self._calibration
+        log: list[str] = []
+        result = {"reader": None, "scale": None, "log": log}
+        src_pid = src_lid = None
+        with contextlib.suppress(Exception):
+            src_pid = george.tv_project_current_id()
+            src_lid = george.tv_layer_current_id()
+        tmp_pid = None
+        try:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="tvpaam_cal_"))
+            george.tv_project_new(tmp_dir / "calib.tvpp", 8, 8, 1.0, 24.0, george.FieldOrder.NONE, 1)
+            tmp_pid = george.tv_project_current_id()
+            if tmp_pid == src_pid:
+                raise RuntimeError("임시 프로젝트가 만들어지지 않았습니다.")
+            lid = george.tv_layer_current_id()
+
+            readers = {
+                "LayerInfo": lambda: self._to_float(self._raw_info_density(lid)),
+                "LayerDensity": lambda: self._to_float(self._raw_current_density(lid)),
+            }
+            ok: dict[tuple[str, str], bool] = {}
+            for scale, value in (("fraction", 0.25), ("percent", 25.0), ("fraction", 0.75), ("percent", 75.0)):
                 try:
-                    self._write_density(layer_id, 0.5)
-                    probe = self._read_density(layer_id)
-                finally:
-                    self._write_density(layer_id, current)
-                self._density_scale = "fraction" if probe is not None and abs(probe - 0.5) < 1e-6 else "percent"
-            self._trace(f"불투명도 단위: {self._density_scale}")
-        return self._density_scale
+                    self._send_density(lid, value)
+                except Exception as exc:  # noqa: BLE001
+                    log.append(f"쓰기 {value} ({scale}): 실패 {exc}")
+                    ok[("LayerInfo", scale)] = ok[("LayerDensity", scale)] = False
+                    continue
+                raw_i = self._raw_info_density(lid)
+                raw_d1 = self._raw_current_density(lid)
+                raw_d2 = self._raw_current_density(lid)  # 두 번 읽어 읽기 자체가 값을 바꾸는지 확인
+                log.append(f"쓰기 {value} ({scale}) → LayerInfo={raw_i!r}, LayerDensity={raw_d1!r} / 재확인 {raw_d2!r}")
+                for name, got in (("LayerInfo", self._to_float(raw_i)), ("LayerDensity", self._to_float(raw_d1))):
+                    match = got is not None and abs(got - value) < 1e-4
+                    if name == "LayerDensity" and raw_d1 != raw_d2:
+                        match = False  # 읽을 때마다 값이 바뀌면 쓸 수 없다
+                    ok[(name, scale)] = ok.get((name, scale), True) and match
+            for name in ("LayerInfo", "LayerDensity"):  # 부작용 없는 LayerInfo 를 먼저 고려
+                for scale in ("fraction", "percent"):
+                    if ok.get((name, scale)):
+                        result["reader"], result["scale"] = name, scale
+                        break
+                if result["reader"]:
+                    break
+            if result["reader"]:
+                self._readers = readers
+            log.append(f"선택: 읽기={result['reader']}, 단위={result['scale']}")
+        except Exception as exc:  # noqa: BLE001
+            log.append(f"보정 실패: {exc}")
+        finally:
+            if tmp_pid is not None:
+                with contextlib.suppress(Exception):
+                    george.tv_project_close(tmp_pid)
+            if src_pid is not None:
+                with contextlib.suppress(Exception):
+                    george.tv_project_select(src_pid)
+            if src_lid is not None:
+                with contextlib.suppress(Exception):
+                    george.tv_layer_set(src_lid)
+        self._calibration = result
+        return result
+
+    @property
+    def opacity_mode(self) -> str:
+        cal = self._calibration
+        if cal is None:
+            return "미확인"
+        if cal["reader"] is None:
+            return "안전 모드 (불투명도를 건드리지 않음)"
+        return f"{cal['reader']} 읽기, {'0~1' if cal['scale'] == 'fraction' else '0~100'} 단위"
+
+    def _read_density(self, layer_id: int) -> float | None:
+        cal = self._calibrate()
+        if cal["reader"] == "LayerInfo":
+            return self._to_float(self._raw_info_density(layer_id))
+        if cal["reader"] == "LayerDensity":
+            return self._to_float(self._raw_current_density(layer_id))
+        return None  # 안전 모드: 값을 모르면 쓰지도 않는다
+
+    def _write_density(self, layer_id: int, value: float) -> None:
+        if self._calibrate()["reader"] is None:
+            return
+        self._send_density(layer_id, value)
 
     def _full_density(self, layer_id: int, current: float) -> float:
-        return 1.0 if self._scale(layer_id, current) == "fraction" else 100.0
+        return 1.0 if self._calibrate()["scale"] == "fraction" else 100.0
 
     def _percent(self, value: float | None) -> str:
         if value is None:
             return "?"
-        return f"{value * 100:.0f}%" if self._density_scale == "fraction" else f"{value:.0f}%"
+        return f"{value * 100:.0f}%" if (self._calibration or {}).get("scale") == "fraction" else f"{value:.0f}%"
 
     def _get_opacity(self, layer_id: int) -> float:
         value = self._read_density(layer_id)
@@ -417,7 +498,7 @@ class TVPaintBackend:
             "name": old.name,
             "start": old.start,
             "position": old.position,
-            "opacity": self._get_opacity(old.id),
+            "opacity": self._read_density(old.id),
             "blending_mode": old.blending_mode,
             "pre_behavior": old.pre_behavior,
             "post_behavior": old.post_behavior,
@@ -439,9 +520,10 @@ class TVPaintBackend:
         for attr in ("blending_mode", "pre_behavior", "post_behavior", "is_visible"):
             with contextlib.suppress(Exception):
                 setattr(new, attr, props[attr])
-        with contextlib.suppress(Exception):
-            if not self._same(self._read_density(new_id), props["opacity"]):
-                self._set_opacity(new_id, props["opacity"])
+        if props["opacity"] is not None:
+            with contextlib.suppress(Exception):
+                if not self._same(self._read_density(new_id), props["opacity"]):
+                    self._set_opacity(new_id, props["opacity"])
         if color_index is not None:
             with contextlib.suppress(Exception):
                 george.tv_layer_color_set(new_id, color_index)
@@ -464,7 +546,7 @@ class TVPaintBackend:
         field = src_project.field_order
         start_frame = src_project.start_frame
         props = {
-            "opacity": self._get_opacity(src_layer.id),
+            "opacity": self._read_density(src_layer.id),
             "blending_mode": src_layer.blending_mode,
             "pre_behavior": src_layer.pre_behavior,
             "post_behavior": src_layer.post_behavior,
@@ -535,6 +617,8 @@ class TVPaintBackend:
     def _verify_opacity(self, src_pid, src_lid, new_pid, new_lid, expected) -> str | None:
         """원본 레이어와 Crop 레이어의 불투명도를 작업 시작 전 값(TVPaint 단위)과 맞추고 다시 읽어 확인한다."""
         if expected is None:
+            if (self._calibration or {}).get("reader") is None:
+                return None  # 안전 모드: 불투명도를 건드리지 않았으므로 확인할 것도 없다
             return "작업 시작 전 불투명도를 읽지 못해 확인을 건너뛰었습니다."
         problems = []
         for pid, lid, label in ((src_pid, src_lid, "원본"), (new_pid, new_lid, "Crop")):

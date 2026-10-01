@@ -117,8 +117,18 @@ def _render_and_analyze(backend: Backend, layer: LayerRef, work: Path, progress:
 
 
 def _method_note(backend: Backend) -> str:
+    lines = []
     method = getattr(backend, "render_method", None)
-    return f"\n(이미지 저장 방식: {method})" if method else ""
+    if method:
+        lines.append(f"이미지 저장 방식: {method}")
+    mode = getattr(backend, "opacity_mode", None)
+    if mode:
+        lines.append(f"불투명도 처리: {mode}")
+    cal = getattr(backend, "_calibration", None)
+    if cal and cal.get("log"):
+        lines.append("--- 불투명도 시험 기록 ---")
+        lines += cal["log"]
+    return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
 def run_compact(backend: Backend, expected_layer_id: int | None, progress: Progress) -> str:
@@ -274,6 +284,7 @@ def build_atlas(backend: Backend, plan: AtlasPlan, progress: Progress) -> str:
             f"프레임 {L.count}개, 셀 {L.cell_w}×{L.cell_h}, {L.cols}열 × {L.rows}행\n"
             f"Atlas {L.width}×{L.height}, 원본 프로젝트는 변경되지 않았습니다.\n"
             "새 프로젝트는 아직 저장되지 않았습니다."
+            + _method_note(backend)
         )
     finally:
         plan.discard()
