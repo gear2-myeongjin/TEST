@@ -35,6 +35,7 @@ C = {
     "accent_hover": "#5687ba",
     "ok": "#6fae6a",
     "bad": "#c0605a",
+    "warn": "#d4a24c",
     "progress_bg": "#262626",
 }
 import os as _os
@@ -76,6 +77,33 @@ class FlatButton(tk.Label):
         self._enabled = enabled
         self.config(fg=C["text"] if enabled else C["text_dim"], bg=self._base, cursor="hand2" if enabled else "arrow")
 
+    # ---- 작업 중 가위질 애니메이션: 글자를 숨기고 버튼 중앙에서 열린/닫힌 가위를 번갈아 보여준다 ----
+    def start_cutting(self, frames: list, interval_ms: int = 500) -> None:
+        if not frames or getattr(self, "_anim_job", None) is not None:
+            return
+        hl = int(self.cget("highlightthickness"))
+        self._saved = {k: self.cget(k) for k in ("text", "padx", "pady", "width", "height")}
+        w, h = self.winfo_width(), self.winfo_height()
+        # 그림만 넣으면 라벨 크기가 바뀌므로, 지금 크기를 픽셀로 고정해 버튼이 줄어들지 않게 한다
+        self.config(text="", padx=0, pady=0, width=max(1, w - 2 * hl), height=max(1, h - 2 * hl), compound="center")
+        self._anim_frames = frames
+        self._anim_index = 0
+        self._anim_interval = interval_ms
+        self._anim_step()
+
+    def _anim_step(self) -> None:
+        self.config(image=self._anim_frames[self._anim_index % len(self._anim_frames)])
+        self._anim_index += 1
+        self._anim_job = self.after(self._anim_interval, self._anim_step)
+
+    def stop_cutting(self) -> None:
+        job = getattr(self, "_anim_job", None)
+        if job is None:
+            return
+        self.after_cancel(job)
+        self._anim_job = None
+        self.config(image="", **self._saved)
+
 
 class Progress(tk.Canvas):
     def __init__(self, master):
@@ -105,6 +133,7 @@ class App:
         self._reconnect_scheduled = False
 
         self._build()
+        self._scissors = _load_scissors(26)  # 참조를 붙잡아 두지 않으면 이미지가 사라진다
         self.root.after(50, self._drain)
         self._connect()
 
@@ -279,18 +308,20 @@ class App:
             self._show_layer(layer)
             if which == "atlas":
                 # Atlas 는 확인창에 셀/배치 정보를 보여줘야 하므로 분석을 먼저 한다 (원본은 바뀌지 않음)
-                self._start(lambda p: analyze_atlas(self.backend, layer.id, p), self._confirm_atlas)
+                self._start(lambda p: analyze_atlas(self.backend, layer.id, p), self._confirm_atlas, self.btn_atlas)
                 return
             if which == "crop":
                 title = "Crop"
                 detail = "선택 레이어의 실제 그림 영역만큼 잘라 새 프로젝트를 만듭니다.\n원본 프로젝트는 바뀌지 않습니다."
                 fn = run_crop
+                button = self.btn_crop
             else:
                 title = "불필요 프레임 삭제"
                 detail = "빈 프레임과 중복 그림을 지우고 전부 1콤마로 만듭니다.\nCtrl+Z 한 번으로 되돌릴 수 있습니다."
                 fn = run_compact
+                button = self.btn_clean
             if ConfirmDialog(self.root, title, layer.name, detail).result:
-                self._start(lambda p: fn(self.backend, layer.id, p), self._show_summary)
+                self._start(lambda p: fn(self.backend, layer.id, p), self._show_summary, button)
 
         self.worker.submit(lambda: self.backend.current_layer(), got_layer, self._on_connect_failed)
 
@@ -304,7 +335,7 @@ class App:
         )
         self.message.config(text="", fg=C["text_dim"])
         if ConfirmDialog(self.root, "Atlas 생성", plan.layer.name, detail, question="Atlas를 생성하시겠습니까?").result:
-            self._start(lambda p: build_atlas(self.backend, plan, p), self._show_summary)
+            self._start(lambda p: build_atlas(self.backend, plan, p), self._show_summary, self.btn_atlas)
         else:
             plan.discard()
 
@@ -312,21 +343,32 @@ class App:
         self.message.config(text="완료", fg=C["ok"])
         MessageDialog(self.root, "완료", summary)
 
-    def _start(self, job: Callable[[Callable[[str, float], None]], object], on_done: Callable[[object], None]) -> None:
+    def _start(
+        self,
+        job: Callable[[Callable[[str, float], None]], object],
+        on_done: Callable[[object], None],
+        button: "FlatButton | None" = None,
+    ) -> None:
         self.running = True
         self._refresh_controls()
         self.message.config(text="")
+        if button is not None:
+            button.start_cutting(self._scissors)
 
         def progress(msg: str, value: float) -> None:
             self.worker.post(lambda: (self.message.config(text=msg, fg=C["text_dim"]), self.progress.set(value)))
 
         def done(value):
+            if button is not None:
+                button.stop_cutting()
             self.running = False
             self.progress.set(0)
             self._refresh_controls()
             on_done(value)
 
         def fail(exc: BaseException, tb: str):
+            if button is not None:
+                button.stop_cutting()
             self.running = False
             self.progress.set(0)
             self._refresh_controls()
@@ -444,6 +486,23 @@ HELP_STEPS = [
 ]
 
 
+def _load_scissors(size: int = 26) -> list:
+    """열린 가위 → 닫힌 가위 순서. 두 이미지는 캔버스 안 위치가 의도적으로 다르므로 캔버스째 같은 크기로 줄인다."""
+    import sys
+
+    frames = []
+    try:
+        from PIL import Image, ImageTk
+
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+        for name in ("scissors_open.png", "scissors_closed.png"):
+            with Image.open(base / "assets" / name) as src:
+                frames.append(ImageTk.PhotoImage(src.convert("RGBA").resize((size, size), Image.LANCZOS)))
+    except Exception:  # noqa: BLE001
+        return []
+    return frames
+
+
 def _load_app_icon(size: int):
     """도움말 머리글용 아이콘. EXE 에 들어 있는 icon.ico 를 읽는다 (없으면 None)."""
     import sys
@@ -487,6 +546,12 @@ class HelpDialog(_Dialog):
             tk.Label(panel, text=desc, fg=C["text_dim"], bg=C["panel"], font=F_BODY, justify="left", wraplength=440).pack(
                 anchor="w"
             )
+
+        tk.Label(
+            self.body,
+            text="주의 : 너무 큰 해상도는 렉과 오류를 유발합니다. 아틀라스의 사이즈가 10000px 이하가 되도록 작업해 주세요.",
+            fg=C["warn"], bg=C["window"], font=F_BODY, justify="left", wraplength=460,
+        ).pack(anchor="w", pady=(12, 0))
 
         row = tk.Frame(self.body, bg=C["window"])
         row.pack(fill="x", pady=(14, 0))
